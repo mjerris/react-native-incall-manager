@@ -244,6 +244,8 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
     @try {
         if ([audioRoute isEqualToString:@"SPEAKER_PHONE"]) {
             _forceSpeakerOn = 1;
+            // --- the mode follows the flag: back to video chat for a video call.
+            [self updateAudioRoute];
             success = [_audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
         } else {
             AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:audioRoute];
@@ -257,6 +259,11 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
                 return;
             }
             _forceSpeakerOn = [audioRoute isEqualToString:@"EARPIECE"] ? -1 : 0;
+            // --- the mode follows the flag. A video call is in video chat mode, which
+            // --- defaults to the speaker: the earpiece needs voice chat mode, or the
+            // --- built-in mic stays paired with the speaker. Mode before preferred input,
+            // --- so the mode change cannot reshuffle the route chosen below.
+            [self updateAudioRoute];
             success = [_audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&error];
             // --- an output-only device (no input) is already the route once the override is gone.
             if (success && input != nil) {
