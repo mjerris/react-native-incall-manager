@@ -101,7 +101,52 @@ function run() {
         ]);
     }
 
-    console.log('index.js wrapper tests passed');
+}
+
+async function runAudioRoutes() {
+    const status = {
+        availableAudioDeviceList: '["EARPIECE","SPEAKER_PHONE","BLUETOOTH"]',
+        selectedAudioDevice: 'BLUETOOTH',
+        selectedAudioDeviceName: 'Headset',
+    };
+    const vibration = { vibrate() {}, cancel() {} };
+
+    {
+        const calls = [];
+        const nativeModule = {
+            chooseAudioRoute(...args) { calls.push(['choose', ...args]); return Promise.resolve(status); },
+            getAudioDeviceStatus() { calls.push(['status']); return Promise.resolve(status); },
+        };
+        const manager = loadManager('ios', nativeModule, vibration);
+
+        assert.deepStrictEqual(await manager.chooseAudioRoute('BLUETOOTH'), status);
+        assert.deepStrictEqual(await manager.getAudioDeviceStatus(), status);
+        assert.deepStrictEqual(calls, [['choose', 'BLUETOOTH'], ['status']]);
+    }
+
+    {
+        const nativeModule = {
+            chooseAudioRoute() { return Promise.reject(new Error('EARPIECE is not available')); },
+        };
+        const manager = loadManager('ios', nativeModule, vibration);
+
+        await assert.rejects(manager.chooseAudioRoute('EARPIECE'), /EARPIECE is not available/);
+    }
+
+    {
+        const nativeModule = {
+            getAudioDeviceStatus() { throw new Error('android native has no getAudioDeviceStatus'); },
+        };
+        const manager = loadManager('android', nativeModule, vibration);
+
+        await assert.rejects(manager.getAudioDeviceStatus(), /android doesn't support getAudioDeviceStatus/);
+    }
 }
 
 run();
+runAudioRoutes().then(() => {
+    console.log('index.js wrapper tests passed');
+}, (err) => {
+    console.error(err);
+    process.exitCode = 1;
+});

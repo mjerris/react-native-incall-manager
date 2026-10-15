@@ -156,6 +156,14 @@ class InCallManager {
         }
     }
 
+    async getAudioDeviceStatus() {
+        if (Platform.OS === 'ios') {
+            return await _InCallManager.getAudioDeviceStatus();
+        } else {
+            throw new Error("android doesn't support getAudioDeviceStatus(), listen for 'onAudioDeviceChanged' instead");
+        }
+    }
+
     async chooseAudioRoute(route) {
         let result = await _InCallManager.chooseAudioRoute(route);
         return result;

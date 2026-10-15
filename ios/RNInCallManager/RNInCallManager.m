@@ -57,6 +57,8 @@
     BOOL _audioSessionInitialized;
     int _forceSpeakerOn;
     NSString *_media;
+    BOOL _hasListeners;
+    NSDictionary *_lastAudioDeviceStatus;
 }
 
 + (BOOL)requiresMainQueueSetup
@@ -120,7 +122,162 @@ RCT_EXPORT_MODULE(InCallManager)
 - (NSArray<NSString *> *)supportedEvents
 {
     return @[@"Proximity",
-             @"WiredHeadset"];
+             @"WiredHeadset",
+             @"onAudioDeviceChanged"];
+}
+
+- (void)startObserving
+{
+    _hasListeners = YES;
+}
+
+- (void)stopObserving
+{
+    _hasListeners = NO;
+}
+
+// --- Audio routes use the same names as Android: EARPIECE, SPEAKER_PHONE, WIRED_HEADSET, BLUETOOTH.
+// --- A call on iOS is routed by its input: the preferred input picks the device (a Bluetooth
+// --- HFP headset or a wired headset carries both directions), and the built-in mic routes the
+// --- output to the receiver. The speaker is an output override on top of that.
+- (NSString *)audioRouteForPortType:(AVAudioSessionPort)portType
+{
+    if ([portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) {
+        return @"EARPIECE";
+    }
+    if ([portType isEqualToString:AVAudioSessionPortBuiltInSpeaker]) {
+        return @"SPEAKER_PHONE";
+    }
+    if ([portType isEqualToString:AVAudioSessionPortHeadphones]
+            || [portType isEqualToString:AVAudioSessionPortHeadsetMic]) {
+        return @"WIRED_HEADSET";
+    }
+    if ([portType isEqualToString:AVAudioSessionPortBluetoothHFP]
+            || [portType isEqualToString:AVAudioSessionPortBluetoothA2DP]
+            || [portType isEqualToString:AVAudioSessionPortBluetoothLE]
+            || [portType isEqualToString:AVAudioSessionPortCarAudio]) {
+        return @"BLUETOOTH";
+    }
+    return nil;
+}
+
+- (BOOL)hasEarpiece
+{
+    return _currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+}
+
+- (AVAudioSessionPortDescription *)preferredInputForAudioRoute:(NSString *)audioRoute
+{
+    // --- the earpiece has no input of its own: the built-in mic selects it.
+    NSString *portType = [audioRoute isEqualToString:@"EARPIECE"] ? AVAudioSessionPortBuiltInMic : nil;
+    for (AVAudioSessionPortDescription *input in _audioSession.availableInputs) {
+        if (portType != nil
+                ? [input.portType isEqualToString:portType]
+                : [[self audioRouteForPortType:input.portType] isEqualToString:audioRoute]) {
+            return input;
+        }
+    }
+    return nil;
+}
+
+- (BOOL)isCurrentOutputAudioRoute:(NSString *)audioRoute
+{
+    for (AVAudioSessionPortDescription *output in _audioSession.currentRoute.outputs) {
+        if ([[self audioRouteForPortType:output.portType] isEqualToString:audioRoute]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (NSDictionary *)audioDeviceStatus
+{
+    NSMutableOrderedSet<NSString *> *available = [NSMutableOrderedSet orderedSet];
+    if ([self hasEarpiece]) {
+        [available addObject:@"EARPIECE"];
+    }
+    [available addObject:@"SPEAKER_PHONE"];
+    for (AVAudioSessionPortDescription *input in _audioSession.availableInputs) {
+        NSString *audioRoute = [self audioRouteForPortType:input.portType];
+        if (audioRoute != nil) {
+            [available addObject:audioRoute];
+        }
+    }
+    // --- output-only devices (wired headphones without a mic, A2DP) have no input to list.
+    AVAudioSessionPortDescription *output = _audioSession.currentRoute.outputs.firstObject;
+    NSString *selected = output != nil ? [self audioRouteForPortType:output.portType] : nil;
+    if (selected != nil) {
+        [available addObject:selected];
+    }
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:available.array options:0 error:nil];
+    NSString *availableJson = json != nil ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] : nil;
+    return @{
+        @"availableAudioDeviceList": availableJson ?: @"[]",
+        @"selectedAudioDevice": selected ?: @"",
+        @"selectedAudioDeviceName": output.portName ?: @"",
+    };
+}
+
+// --- like android, only report when the available routes or the selected one changed.
+- (void)sendAudioDeviceChanged
+{
+    NSDictionary *status = [self audioDeviceStatus];
+    @synchronized (self) {
+        if ([status isEqualToDictionary:_lastAudioDeviceStatus]) {
+            return;
+        }
+        _lastAudioDeviceStatus = status;
+    }
+    if (_hasListeners) {
+        [self sendEventWithName:@"onAudioDeviceChanged" body:status];
+    }
+}
+
+RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
+                           resolve:(RCTPromiseResolveBlock)resolve
+                            reject:(RCTPromiseRejectBlock)reject)
+{
+    NSLog(@"RNInCallManager.chooseAudioRoute(): audioRoute=%@", audioRoute);
+    NSError *error = nil;
+    BOOL success = NO;
+    @try {
+        if ([audioRoute isEqualToString:@"SPEAKER_PHONE"]) {
+            _forceSpeakerOn = 1;
+            success = [_audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:&error];
+        } else {
+            AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:audioRoute];
+            BOOL available = [audioRoute isEqualToString:@"EARPIECE"]
+                ? [self hasEarpiece] && input != nil
+                : input != nil || [self isCurrentOutputAudioRoute:audioRoute];
+            if (!available) {
+                reject(@"E_AUDIO_ROUTE_UNAVAILABLE",
+                       [NSString stringWithFormat:@"chooseAudioRoute(): %@ is not available", audioRoute],
+                       nil);
+                return;
+            }
+            _forceSpeakerOn = [audioRoute isEqualToString:@"EARPIECE"] ? -1 : 0;
+            success = [_audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&error];
+            // --- an output-only device (no input) is already the route once the override is gone.
+            if (success && input != nil) {
+                success = [_audioSession setPreferredInput:input error:&error];
+            }
+        }
+    } @catch (NSException *e) {
+        reject(@"E_AUDIO_ROUTE", [NSString stringWithFormat:@"chooseAudioRoute(): %@", e.reason], nil);
+        return;
+    }
+    if (!success) {
+        reject(@"E_AUDIO_ROUTE", error.localizedDescription ?: @"chooseAudioRoute() failed", error);
+        return;
+    }
+    resolve([self audioDeviceStatus]);
+}
+
+RCT_EXPORT_METHOD(getAudioDeviceStatus:(RCTPromiseResolveBlock)resolve
+                                reject:(RCTPromiseRejectBlock)reject)
+{
+    resolve([self audioDeviceStatus]);
 }
 
 RCT_EXPORT_METHOD(start:(NSString *)mediaType
@@ -141,6 +298,9 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     NSLog(@"RNInCallManager.start() start InCallManager. media=%@, type=%@, mode=%@", _media, _media, _incallAudioMode);
     [self storeOriginalAudioSetup];
     _forceSpeakerOn = 0;
+    @synchronized (self) {
+        _lastAudioDeviceStatus = nil;
+    }
     [self startAudioSessionNotification];
     [self audioSessionSetCategory:_incallAudioCategory
                           options:0
@@ -798,6 +958,8 @@ RCT_EXPORT_METHOD(stopProximitySensor)
 
             NSNumber *routeChangeType = [notification.userInfo objectForKey:@"AVAudioSessionRouteChangeReasonKey"];
             NSUInteger routeChangeTypeValue = [routeChangeType unsignedIntegerValue];
+
+            [self sendAudioDeviceChanged];
 
             switch (routeChangeTypeValue) {
                 case AVAudioSessionRouteChangeReasonUnknown:

@@ -1,3 +1,15 @@
+export type AudioRoute = "EARPIECE" | "SPEAKER_PHONE" | "WIRED_HEADSET" | "BLUETOOTH";
+
+/** What `chooseAudioRoute()` resolves with and `onAudioDeviceChanged` carries. */
+export interface AudioDeviceStatus {
+  /** JSON array of the available routes, e.g. '["EARPIECE","SPEAKER_PHONE","BLUETOOTH"]'. */
+  availableAudioDeviceList: string;
+  /** The route in use, or "" when none is known. */
+  selectedAudioDevice: AudioRoute | "";
+  /** iOS only: the name of the output in use, e.g. "AirPods Pro". */
+  selectedAudioDeviceName?: string;
+}
+
 declare class InCallManager {
   vibrate: boolean;
   audioUriMap: {
@@ -53,7 +65,10 @@ declare class InCallManager {
 
   getAudioUri(audioType: string, fileType: string): Promise<string | null>;
 
-  chooseAudioRoute(route: string): Promise<any>;
+  chooseAudioRoute(route: AudioRoute): Promise<AudioDeviceStatus>;
+
+  /** iOS only. */
+  getAudioDeviceStatus(): Promise<AudioDeviceStatus>;
 
   requestAudioFocus(): Promise<any>;
 
