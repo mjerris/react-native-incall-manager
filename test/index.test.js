@@ -5,12 +5,12 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-function loadManager(platform, nativeModule, vibration) {
+function loadManager(platform, nativeModule, vibration, emitters = {}) {
     const filename = path.join(__dirname, '..', 'index.js');
     let source = fs.readFileSync(filename, 'utf8');
     source = source.replace(
-        /import \{\s*Platform,\s*Vibration,\s*\} from 'react-native';/,
-        "const { Platform, Vibration } = require('react-native');"
+        /import \{([^}]*)\} from 'react-native';/,
+        (_, names) => `const {${names}} = require('react-native');`
     );
     source = source.replace(
         'export default new InCallManager();',
@@ -28,6 +28,8 @@ function loadManager(platform, nativeModule, vibration) {
                 NativeModules: { InCallManager: nativeModule },
                 Platform: { OS: platform },
                 Vibration: vibration,
+                NativeEventEmitter: emitters.NativeEventEmitter,
+                DeviceEventEmitter: emitters.DeviceEventEmitter,
             };
         },
     };
@@ -143,8 +145,46 @@ async function runAudioRoutes() {
     }
 }
 
+async function runListeners() {
+    const vibration = { vibrate() {}, cancel() {} };
+
+    {
+        // iOS: RCTEventEmitter only sends while a NativeEventEmitter built on this module has a
+        // listener; DeviceEventEmitter.addListener alone never reaches the native side.
+        const made = [];
+        class NativeEventEmitter {
+            constructor(module) { this.module = module; made.push(this); this.added = []; }
+            addListener(event, listener) { this.added.push(event); return { remove() {}, event, listener }; }
+        }
+        const nativeModule = {};
+        const deviceEventEmitter = { addListener() { throw new Error('ios must not use DeviceEventEmitter'); } };
+        const manager = loadManager('ios', nativeModule, vibration, { NativeEventEmitter, DeviceEventEmitter: deviceEventEmitter });
+
+        const listener = () => {};
+        const first = manager.addListener('onAudioDeviceChanged', listener);
+        manager.addListener('Proximity', listener);
+
+        assert.strictEqual(made.length, 1);
+        assert.strictEqual(made[0].module, nativeModule);
+        assert.deepStrictEqual(made[0].added, ['onAudioDeviceChanged', 'Proximity']);
+        assert.strictEqual(first.listener, listener);
+        assert.strictEqual(typeof first.remove, 'function');
+    }
+
+    {
+        // Android sends through RCTDeviceEventEmitter, which DeviceEventEmitter listens to.
+        const added = [];
+        const deviceEventEmitter = { addListener(event) { added.push(event); return { remove() {} }; } };
+        class NativeEventEmitter { constructor() { throw new Error('android uses DeviceEventEmitter'); } }
+        const manager = loadManager('android', {}, vibration, { NativeEventEmitter, DeviceEventEmitter: deviceEventEmitter });
+
+        manager.addListener('onAudioDeviceChanged', () => {});
+        assert.deepStrictEqual(added, ['onAudioDeviceChanged']);
+    }
+}
+
 run();
-runAudioRoutes().then(() => {
+Promise.all([runAudioRoutes(), runListeners()]).then(() => {
     console.log('index.js wrapper tests passed');
 }, (err) => {
     console.error(err);

@@ -4,8 +4,8 @@ export type AudioRoute = "EARPIECE" | "SPEAKER_PHONE" | "WIRED_HEADSET" | "BLUET
 export interface AudioDeviceStatus {
   /** JSON array of the available routes, e.g. '["EARPIECE","SPEAKER_PHONE","BLUETOOTH"]'. */
   availableAudioDeviceList: string;
-  /** The route in use, or "" when none is known. */
-  selectedAudioDevice: AudioRoute | "";
+  /** The route in use: "" on iOS when none is known, "NONE" on Android when none is selected. */
+  selectedAudioDevice: AudioRoute | "NONE" | "";
   /** iOS only: the name of the output in use, e.g. "AirPods Pro". */
   selectedAudioDeviceName?: string;
 }
@@ -40,7 +40,8 @@ declare class InCallManager {
 
   setSpeakerphoneOn(enable: boolean): void;
 
-  setForceSpeakerphoneOn(flag: boolean): void;
+  /** true forces the speaker on, false off, null uses the media type's default. */
+  setForceSpeakerphoneOn(flag: boolean | null): void;
 
   setMicrophoneMute(enable: boolean): void;
 
@@ -65,10 +66,23 @@ declare class InCallManager {
 
   getAudioUri(audioType: string, fileType: string): Promise<string | null>;
 
-  chooseAudioRoute(route: AudioRoute): Promise<AudioDeviceStatus>;
+  /** A route name; a plain string is accepted too, as before routes were typed. */
+  chooseAudioRoute(route: AudioRoute | (string & {})): Promise<AudioDeviceStatus>;
 
   /** iOS only. */
   getAudioDeviceStatus(): Promise<AudioDeviceStatus>;
+
+  /**
+   * Subscribes to one of this module's events. Use this rather than
+   * DeviceEventEmitter: on iOS the native side sends only to a NativeEventEmitter.
+   */
+  addListener(event: "onAudioDeviceChanged", listener: (status: AudioDeviceStatus) => void): { remove(): void };
+  addListener(event: "Proximity", listener: (data: { isNear: boolean }) => void): { remove(): void };
+  addListener(
+    event: "WiredHeadset",
+    listener: (data: { isPlugged: boolean; hasMic: boolean; deviceName: string }) => void
+  ): { remove(): void };
+  addListener(event: string, listener: (data: any) => void): { remove(): void };
 
   requestAudioFocus(): Promise<any>;
 
