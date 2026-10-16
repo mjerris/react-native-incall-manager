@@ -145,6 +145,9 @@ async function runAudioRoutes() {
     }
 }
 
+// What RNInCallManager.m's supportedEvents returns (and exports as the supportedEvents constant).
+const IOS_NATIVE_EVENTS = ['Proximity', 'WiredHeadset', 'onAudioDeviceChanged'];
+
 async function runListeners() {
     const vibration = { vibrate() {}, cancel() {} };
 
@@ -156,7 +159,7 @@ async function runListeners() {
             constructor(module) { this.module = module; made.push(this); this.added = []; }
             addListener(event, listener) { this.added.push(event); return { remove() {}, event, listener }; }
         }
-        const nativeModule = {};
+        const nativeModule = { supportedEvents: IOS_NATIVE_EVENTS };
         const deviceEventEmitter = { addListener() { throw new Error('ios must not use DeviceEventEmitter'); } };
         const manager = loadManager('ios', nativeModule, vibration, { NativeEventEmitter, DeviceEventEmitter: deviceEventEmitter });
 
@@ -180,7 +183,7 @@ async function runListeners() {
             constructor() { this.added = []; made.push(this); }
             addListener(event) { this.added.push(event); return { remove() {} }; }
         }
-        const manager = loadManager('ios', {}, vibration, { NativeEventEmitter, DeviceEventEmitter: {} });
+        const manager = loadManager('ios', { supportedEvents: IOS_NATIVE_EVENTS }, vibration, { NativeEventEmitter, DeviceEventEmitter: {} });
 
         for (const event of ['NoisyAudio', 'MediaButton', 'onAudioFocusChange']) {
             const subscription = manager.addListener(event, () => {});
@@ -189,6 +192,23 @@ async function runListeners() {
         }
         manager.addListener('WiredHeadset', () => {});
         assert.deepStrictEqual(made.flatMap((emitter) => emitter.added), ['WiredHeadset']);
+    }
+
+    {
+        // iOS: which events exist comes from the native module (its supportedEvents, exported as a
+        // constant), not a copy in index.js: an event added natively is subscribed, one the module
+        // doesn't send isn't.
+        const made = [];
+        class NativeEventEmitter {
+            constructor() { this.added = []; made.push(this); }
+            addListener(event) { this.added.push(event); return { remove() {} }; }
+        }
+        const nativeModule = { supportedEvents: ['Proximity', 'onRouteNews'] };
+        const manager = loadManager('ios', nativeModule, vibration, { NativeEventEmitter, DeviceEventEmitter: {} });
+
+        manager.addListener('onRouteNews', () => {});
+        manager.addListener('WiredHeadset', () => {});
+        assert.deepStrictEqual(made.flatMap((emitter) => emitter.added), ['onRouteNews']);
     }
 
     {

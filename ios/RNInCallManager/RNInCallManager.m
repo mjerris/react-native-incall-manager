@@ -194,6 +194,13 @@ RCT_EXPORT_MODULE(InCallManager)
              @"onAudioDeviceChanged"];
 }
 
+// --- the events, for index.js's addListener, which returns a silent subscription for any other
+// --- (RCTEventEmitter's addListener: reports an unsupported name as an error).
+- (NSDictionary *)constantsToExport
+{
+    return @{@"supportedEvents": [self supportedEvents]};
+}
+
 // --- startObserving and stopObserving run on the method queue (RCTEventEmitter's addListener: and
 // --- removeListeners: are methods of this module).
 - (void)startObserving

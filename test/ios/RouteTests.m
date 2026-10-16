@@ -605,6 +605,7 @@ static void s_stale_route_change_after_restart(void)
 // listed) while a wired headset is plugged in.
 static void s_choices(void)
 {
+    CHECK([[gM constantsToExport][@"supportedEvents"] isEqual:[gM supportedEvents]], @"the supportedEvents constant is the module's list");
     STEP(@"AirPods connected; start('audio')");
     gFake.bt = YES;
     start(@"audio");

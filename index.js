@@ -7,8 +7,13 @@ import {
     Vibration,
 } from 'react-native';
 
-// --- the events the iOS module sends (its supportedEvents).
-const IOS_EVENTS = ['Proximity', 'WiredHeadset', 'onAudioDeviceChanged'];
+// --- the events the iOS module sends: its supportedEvents, which it exports as a constant, so
+// --- this file keeps no copy of the list. Without the constant (a mocked module), every event is
+// --- passed on and the native side decides.
+function iosSupportsEvent(eventName) {
+    const events = _InCallManager && _InCallManager.supportedEvents;
+    return !Array.isArray(events) || events.indexOf(eventName) !== -1;
+}
 
 class InCallManager {
     constructor() {
@@ -174,12 +179,12 @@ class InCallManager {
     // On iOS the native side sends events only while a NativeEventEmitter built on
     // this module has listeners, so DeviceEventEmitter.addListener alone hears
     // nothing there. Android sends through DeviceEventEmitter.
-    // The iOS module sends only IOS_EVENTS; for the Android-only events a no-op
+    // The iOS module sends only its supportedEvents; for the Android-only events a no-op
     // subscription is returned, since the native addListener: reports any other
     // name as an error (a RedBox in a debug build).
     addListener(eventName, listener) {
         if (Platform.OS === 'ios') {
-            if (IOS_EVENTS.indexOf(eventName) === -1) {
+            if (!iosSupportsEvent(eventName)) {
                 return { remove() {} };
             }
             this.emitter = this.emitter || new NativeEventEmitter(_InCallManager);
