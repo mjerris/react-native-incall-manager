@@ -66,6 +66,11 @@
     // --- the next session has started (and set the registered flags again) by the time it runs.
     // --- Read and written only on the route queue.
     NSUInteger _sessionGeneration;
+    // --- the call's session is interrupted (another call took the audio: a CallKit hold, a
+    // --- cellular call): route changes then are the other call's, and aren't followed. Cleared by the
+    // --- interruption's end, by a category change (the session being set up again on resume: callkeep
+    // --- on CallKit's activation, WebRTC) and by start(). Route queue only.
+    BOOL _sessionInterrupted;
     int _forceSpeakerOn;
     NSString *_media;
     BOOL _hasListeners;
@@ -711,6 +716,7 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     _forceSpeakerOn = 0;
     _lastAudioDeviceStatus = nil;
     _sessionGeneration += 1;
+    _sessionInterrupted = NO;
     [self startAudioSessionNotification];
     [self audioSessionSetCategory:_incallAudioCategory
                           options:0
@@ -1432,6 +1438,8 @@ RCT_EXPORT_METHOD(stopProximitySensor)
                  name:AVAudioSessionInterruptionNotification
                object:nil];
 
+    __weak RNInCallManager *weakSelf = self;
+    const NSUInteger generation = _sessionGeneration;
     _audioSessionInterruptionObserver = [self startObserve:AVAudioSessionInterruptionNotification
                                                     object:nil
                                                      queue:nil
@@ -1443,14 +1451,27 @@ RCT_EXPORT_METHOD(stopProximitySensor)
 
         //NSUInteger rawValue = notification.userInfo[AVAudioSessionInterruptionTypeKey].unsignedIntegerValue;
         NSNumber *interruptType = [notification.userInfo objectForKey:@"AVAudioSessionInterruptionTypeKey"];
+        BOOL interrupted;
         if ([interruptType unsignedIntegerValue] == AVAudioSessionInterruptionTypeBegan) {
             NSLog(@"RNInCallManager.AudioSessionInterruptionNotification: Began");
+            interrupted = YES;
         } else if ([interruptType unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded) {
             NSLog(@"RNInCallManager.AudioSessionInterruptionNotification: Ended");
+            interrupted = NO;
         } else {
             NSLog(@"RNInCallManager.AudioSessionInterruptionNotification: Unknow Value");
+            return;
         }
-        //NSLog(@"RNInCallManager.AudioSessionInterruptionNotification: could not resolve notification");
+        RNInCallManager *strongSelf = weakSelf;
+        if (strongSelf == nil) {
+            return;
+        }
+        // --- in order with the route changes, for this call's session only.
+        dispatch_async(strongSelf->_routeQueue, ^{
+            if (generation == strongSelf->_sessionGeneration) {
+                strongSelf->_sessionInterrupted = interrupted;
+            }
+        });
     }];
 
     _isAudioSessionInterruptionRegistered = YES;
@@ -1544,8 +1565,12 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     [self sendWiredHeadsetForRouteChange:reason previousRoute:previousRoute route:route inputs:inputs wiredBefore:wiredBefore];
     if (reason == AVAudioSessionRouteChangeReasonCategoryChange) {
         // --- someone else (WebRTC, CallKit) changed the category, which drops the speaker
-        // --- override: put the forced route back.
+        // --- override: put the forced route back. On a resume this is the session set up again.
+        _sessionInterrupted = NO;
         [self updateAudioRoute];
+    } else if (_sessionInterrupted) {
+        // --- another call has the audio: its route isn't this call's choice.
+        NSLog(@"RNInCallManager.AudioRouteChange: the session is interrupted; not following");
     } else {
         [self followRouteChange:reason previousRoute:previousRoute currentRoute:route];
     }

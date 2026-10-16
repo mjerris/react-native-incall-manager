@@ -300,9 +300,13 @@ forced speaker setting (`setForceSpeakerphoneOn` / `chooseAudioRoute`) in step w
 changes it didn't make, so the re-apply keeps them instead of undoing them: a headset, USB
 headset or car taking the call puts the setting back to the media's default and drops an
 earlier choice's preferred input; the system route picker (`AVRoutePickerView`) or CallKit's
-speaker button choosing the speaker, the receiver or a device sets it. After a media services
-reset the module sets up the call's session, chosen device and speaker setting again, and restarts
-a ringback or busy tone that was playing.
+speaker button choosing the speaker, the receiver or a device sets it when iOS reports the change
+with reason `Override`, `Unknown` or `RouteConfigurationChange`. A change reported as
+`CategoryChange` is re-applied over instead (which reason iOS posts for these hasn't been confirmed
+on a device; the `RNInCallManager.AudioRouteChange.Reason` log line shows it). While the call's
+session is interrupted (on hold for another call), route changes aren't followed: they are the
+other call's. After a media services reset the module sets up the call's session, chosen device
+and speaker setting again, and restarts a ringback or busy tone that was playing.
 
 ## LICENSE:
 

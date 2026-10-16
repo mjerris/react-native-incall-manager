@@ -883,6 +883,44 @@ static void s_app_preferred_input_restored(void)
     CHECK(gFake.preferredInput == nil, @"no preference is left after the call (%@)", gFake.preferredInput);
 }
 
+static void interruption(AVAudioSessionInterruptionType type)
+{
+    dispatch_sync(gNotifyQ, ^{
+        H(@"  (iOS) posting AVAudioSessionInterruptionNotification %@", type == AVAudioSessionInterruptionTypeBegan ? @"Began" : @"Ended");
+        [[NSNotificationCenter defaultCenter] postNotificationName:AVAudioSessionInterruptionNotification object:gFake
+                                                          userInfo:@{AVAudioSessionInterruptionTypeKey: @(type)}];
+    });
+    drain();
+}
+
+// The call is put on hold for another call (an interruption): the other call's speaker isn't taken
+// as this call's choice, so the call resumes where it was, on the receiver.
+static void s_held_call_keeps_its_route(void)
+{
+    STEP(@"start('audio') on the receiver (flag 0)");
+    start(@"audio");
+    CHECK([output() isEqualToString:@"Receiver"] && flag() == 0, @"on the receiver (%@, %d)", output(), flag());
+    STEP(@"Hold & Accept: the session is interrupted; the user turns on the other call's speaker, posted to this app as Override");
+    interruption(AVAudioSessionInterruptionTypeBegan);
+    [gFake systemPick:@"speaker" reason:AVAudioSessionRouteChangeReasonOverride];
+    deliver();
+    CHECK(flag() == 0, @"the flag stays 0 (%d)", flag());
+    STEP(@"the other call ends; CallKit re-activates this one and callkeep sets the category (CategoryChange)");
+    [gFake externalCategory:AVAudioSessionCategoryPlayAndRecord options:0x24 mode:AVAudioSessionModeDefault];
+    deliver();
+    CHECK([output() isEqualToString:@"Receiver"] && flag() == 0, @"the call resumes on the receiver (%@, %d)", output(), flag());
+    STEP(@"after the resume, CallKit's speaker button is followed again");
+    [gFake systemPick:@"speaker" reason:AVAudioSessionRouteChangeReasonOverride];
+    deliver();
+    CHECK(flag() == 1, @"followed: flag 1 (%d)", flag());
+    STEP(@"an interruption that ends with an Ended notification");
+    interruption(AVAudioSessionInterruptionTypeBegan);
+    interruption(AVAudioSessionInterruptionTypeEnded);
+    [gFake systemPick:@"receiver" reason:AVAudioSessionRouteChangeReasonOverride];
+    deliver();
+    CHECK(flag() == -1, @"followed after Ended: flag -1 (%d)", flag());
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
@@ -898,6 +936,7 @@ int main(int argc, char **argv)
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
             @"media-reset-keeps-speaker": ^{ s_media_reset_keeps_speaker(); },
             @"media-reset-players": ^{ s_media_reset_players(); },
+            @"held-call-keeps-its-route": ^{ s_held_call_keeps_its_route(); },
             @"headphones-under-speaker": ^{ s_headphones_under_speaker(); },
             @"headset-mic-under-earpiece-pin": ^{ s_headset_mic_under_earpiece_pin(); },
             @"usb-microphone": ^{ s_usb_microphone(); },
