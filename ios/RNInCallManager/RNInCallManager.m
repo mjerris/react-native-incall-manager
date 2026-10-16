@@ -1386,11 +1386,15 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
 // --- iOS 26+: a device can become available without taking the route (a headset connecting
 // --- while the receiver is pinned), which posts no route change. Earlier iOS has no such
 // --- notification, and the list then catches up on the next route change.
+// --- The notification is declared only by the iOS 26 SDK and later: @available is a runtime check
+// --- and doesn't declare it, so an older SDK (Xcode 16) needs the compile-time guard as well.
+// --- (260000 rather than __IPHONE_26_0, which an older SDK doesn't define.)
 - (void)startAudioSessionAvailableInputsChangeNotification
 {
     if (_isAudioSessionAvailableInputsChangeRegistered) {
         return;
     }
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
     if (@available(iOS 26.0, *)) {
         NSLog(@"RNInCallManager.startAudioSessionAvailableInputsChangeNotification()");
         [self stopObserve:_audioSessionAvailableInputsChangeObserver
@@ -1416,6 +1420,7 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
         }];
         _isAudioSessionAvailableInputsChangeRegistered = YES;
     }
+#endif
 }
 
 - (void)stopAudioSessionAvailableInputsChangeNotification
@@ -1423,12 +1428,14 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     if (!_isAudioSessionAvailableInputsChangeRegistered) {
         return;
     }
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
     if (@available(iOS 26.0, *)) {
         NSLog(@"RNInCallManager.stopAudioSessionAvailableInputsChangeNotification()");
         [self stopObserve:_audioSessionAvailableInputsChangeObserver
                      name:AVAudioSessionAvailableInputsChangeNotification
                    object:nil];
     }
+#endif
     _isAudioSessionAvailableInputsChangeRegistered = NO;
 }
 
