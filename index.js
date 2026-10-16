@@ -7,6 +7,9 @@ import {
     Vibration,
 } from 'react-native';
 
+// --- the events the iOS module sends (its supportedEvents).
+const IOS_EVENTS = ['Proximity', 'WiredHeadset', 'onAudioDeviceChanged'];
+
 class InCallManager {
     constructor() {
         this.vibrate = false;
@@ -171,8 +174,14 @@ class InCallManager {
     // On iOS the native side sends events only while a NativeEventEmitter built on
     // this module has listeners, so DeviceEventEmitter.addListener alone hears
     // nothing there. Android sends through DeviceEventEmitter.
+    // The iOS module sends only IOS_EVENTS; for the Android-only events a no-op
+    // subscription is returned, since the native addListener: reports any other
+    // name as an error (a RedBox in a debug build).
     addListener(eventName, listener) {
         if (Platform.OS === 'ios') {
+            if (IOS_EVENTS.indexOf(eventName) === -1) {
+                return { remove() {} };
+            }
             this.emitter = this.emitter || new NativeEventEmitter(_InCallManager);
             return this.emitter.addListener(eventName, listener);
         }

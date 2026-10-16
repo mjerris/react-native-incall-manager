@@ -224,8 +224,10 @@ subscription.remove();
 
 Use `InCallManager.addListener()` rather than `DeviceEventEmitter.addListener()`. On iOS the
 module sends events only while a `NativeEventEmitter` built on it has listeners, so a
-`DeviceEventEmitter` listener there never hears anything. `addListener()` does the right thing
-on each platform.
+`DeviceEventEmitter` listener there hears nothing unless some other code happens to hold such a
+listener. `addListener()` does the right thing on each platform, and on iOS it returns a
+subscription that never fires for the Android-only events (`NoisyAudio`, `MediaButton`,
+`onAudioFocusChange`).
 
 
 

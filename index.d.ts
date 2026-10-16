@@ -4,7 +4,7 @@ export type AudioRoute = "EARPIECE" | "SPEAKER_PHONE" | "WIRED_HEADSET" | "BLUET
 export interface AudioDeviceStatus {
   /** JSON array of the available routes, e.g. '["EARPIECE","SPEAKER_PHONE","BLUETOOTH"]'. */
   availableAudioDeviceList: string;
-  /** The route in use: "" on iOS when none is known, "NONE" on Android when none is selected. */
+  /** The route in use, or "" when none is (Android may also send "NONE"). */
   selectedAudioDevice: AudioRoute | "NONE" | "";
   /** iOS only: the name of the output in use, e.g. "AirPods Pro". */
   selectedAudioDeviceName?: string;
@@ -66,8 +66,11 @@ declare class InCallManager {
 
   getAudioUri(audioType: string, fileType: string): Promise<string | null>;
 
-  /** A route name; a plain string is accepted too, as before routes were typed. */
-  chooseAudioRoute(route: AudioRoute | (string & {})): Promise<AudioDeviceStatus>;
+  /**
+   * A route name; a plain string is accepted too, as before routes were typed. Resolves with an
+   * `AudioDeviceStatus` (typed `any`, as in 4.3.0, so existing callers keep compiling).
+   */
+  chooseAudioRoute(route: AudioRoute | (string & {})): Promise<any>;
 
   /** iOS only. */
   getAudioDeviceStatus(): Promise<AudioDeviceStatus>;

@@ -172,6 +172,26 @@ async function runListeners() {
     }
 
     {
+        // iOS: an event the iOS module never sends (Android-only: NoisyAudio, MediaButton,
+        // onAudioFocusChange) must not reach NativeEventEmitter, whose native addListener:
+        // RCTLogError's (a RedBox in debug) for a name outside supportedEvents.
+        const made = [];
+        class NativeEventEmitter {
+            constructor() { this.added = []; made.push(this); }
+            addListener(event) { this.added.push(event); return { remove() {} }; }
+        }
+        const manager = loadManager('ios', {}, vibration, { NativeEventEmitter, DeviceEventEmitter: {} });
+
+        for (const event of ['NoisyAudio', 'MediaButton', 'onAudioFocusChange']) {
+            const subscription = manager.addListener(event, () => {});
+            assert.strictEqual(typeof subscription.remove, 'function');
+            subscription.remove();
+        }
+        manager.addListener('WiredHeadset', () => {});
+        assert.deepStrictEqual(made.flatMap((emitter) => emitter.added), ['WiredHeadset']);
+    }
+
+    {
         // Android sends through RCTDeviceEventEmitter, which DeviceEventEmitter listens to.
         const added = [];
         const deviceEventEmitter = { addListener(event) { added.push(event); return { remove() {} }; } };
@@ -183,7 +203,20 @@ async function runListeners() {
     }
 }
 
+// The typings and README: 4.3.0 declared chooseAudioRoute(): Promise<any>, and narrowing it in a
+// minor release breaks callers that assign the result loosely; selectedAudioDevice is "" on both
+// platforms when nothing is selected (Android sends "" for a null device); a DeviceEventEmitter
+// listener on iOS does hear events while any NativeEventEmitter listener exists.
+function runTypings() {
+    const dts = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
+    assert.match(dts, /chooseAudioRoute\(route: AudioRoute \| \(string & \{\}\)\): Promise<any>;/);
+    assert.doesNotMatch(dts, /"NONE" on Android when none is selected/);
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    assert.doesNotMatch(readme, /never hears anything/);
+}
+
 run();
+runTypings();
 Promise.all([runAudioRoutes(), runListeners()]).then(() => {
     console.log('index.js wrapper tests passed');
 }, (err) => {
