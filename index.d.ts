@@ -69,9 +69,11 @@ declare class InCallManager {
   /**
    * A route name; a plain string is accepted too, as before routes were typed. Resolves with an
    * `AudioDeviceStatus` (typed `any`, as in 4.3.0, so existing callers keep compiling).
-   * iOS: resolves once the output is on the chosen route, or after a second with the route iOS
-   * settled on; rejects E_AUDIO_ROUTE_UNAVAILABLE (route unchanged) for a route that isn't
-   * there, EARPIECE included while a wired or USB headset is plugged in.
+   * iOS: rejects E_AUDIO_ROUTE_INACTIVE outside start()...stop(). Resolves once the output is on
+   * the chosen route, or after a second with the route iOS settled on. Rejects
+   * E_AUDIO_ROUTE_UNAVAILABLE (route unchanged) for a route that isn't there, EARPIECE included
+   * while a wired or USB headset is plugged in, and E_AUDIO_ROUTE when AVAudioSession refuses the
+   * choice (the speaker setting is put back as it was).
    */
   chooseAudioRoute(route: AudioRoute | (string & {})): Promise<any>;
 

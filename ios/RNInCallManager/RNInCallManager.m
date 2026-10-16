@@ -69,6 +69,8 @@
     // --- the route a chooseAudioRoute call pinned the preferred input for (EARPIECE: the built-in
     // --- mic), so it can be pinned again after a media services reset; nil when nothing is pinned.
     NSString *_chosenInputRoute;
+    // --- and the port it pinned (its UID), so the same device is pinned again, not another of the route.
+    NSString *_chosenInputUID;
     // --- a choice whose route hasn't shown up in currentRoute yet, answered when it does.
     NSString *_pendingChoiceRoute;
     RCTPromiseResolveBlock _pendingChoiceResolve;
@@ -251,20 +253,39 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
     return _currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
 }
 
-- (AVAudioSessionPortDescription *)preferredInputForAudioRoute:(NSString *)audioRoute
-{
-    return [self preferredInputForAudioRoute:audioRoute inputs:_audioSession.availableInputs];
-}
-
+/**
+ * The input that puts the call on `audioRoute`, out of `inputs`. A route can have more than one
+ * (two headsets, a car and AirPods): the one with the UID `uid` if given (the device chosen before),
+ * else the one already carrying the call (`route`'s input), else the preferred one, else the first.
+ */
 - (AVAudioSessionPortDescription *)preferredInputForAudioRoute:(NSString *)audioRoute
                                                          inputs:(NSArray<AVAudioSessionPortDescription *> *)inputs
+                                                          route:(AVAudioSessionRouteDescription *)route
+                                                            uid:(NSString *)uid
 {
+    NSMutableArray<NSString *> *wanted = [NSMutableArray array];
+    if (uid != nil) {
+        [wanted addObject:uid];
+    }
+    for (AVAudioSessionPortDescription *input in route.inputs) {
+        [wanted addObject:input.UID ?: @""];
+    }
+    [wanted addObject:_audioSession.preferredInput.UID ?: @""];
+    AVAudioSessionPortDescription *first = nil;
+    AVAudioSessionPortDescription *best = nil;
+    NSUInteger bestRank = NSNotFound;
     for (AVAudioSessionPortDescription *input in inputs) {
-        if ([[self audioRouteForInputPort:input.portType] isEqualToString:audioRoute]) {
-            return input;
+        if (![[self audioRouteForInputPort:input.portType] isEqualToString:audioRoute]) {
+            continue;
+        }
+        first = first ?: input;
+        NSUInteger rank = input.UID != nil ? [wanted indexOfObject:input.UID] : NSNotFound;
+        if (rank < bestRank) {
+            best = input;
+            bestRank = rank;
         }
     }
-    return nil;
+    return best ?: first;
 }
 
 /** Whether one of `route`'s outputs is on `audioRoute`. */
@@ -373,6 +394,7 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
 - (void)clearPreferredInput:(NSString *)caller
 {
     _chosenInputRoute = nil;
+    _chosenInputUID = nil;
     NSError *error = nil;
     if (![_audioSession setPreferredInput:nil error:&error]) {
         NSLog(@"RNInCallManager.%@: setPreferredInput(nil) failed: %@", caller, error);
@@ -461,10 +483,12 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
 /**
  * An output-only device (mic-less headphones, A2DP) has no input to find it by, and only a
  * forced speaker can hide it. Looks under the override, putting it back if the device isn't there.
+ * Only while the speaker has the call (`route`): the flag can outlive the override (a device change
+ * to HDMI or AirPlay keeps flag 1), and putting the override back then would move the call.
  */
-- (BOOL)isOutputUnderSpeakerOverride:(NSString *)audioRoute
+- (BOOL)isOutputUnderSpeakerOverride:(NSString *)audioRoute route:(AVAudioSessionRouteDescription *)route
 {
-    if (_forceSpeakerOn != 1) {
+    if (_forceSpeakerOn != 1 || ![self route:route hasOutputOnAudioRoute:@"SPEAKER_PHONE"]) {
         return NO;
     }
     [self overrideOutputAudioPort:AVAudioSessionPortOverrideNone caller:@"chooseAudioRoute()"];
@@ -540,6 +564,9 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
     }
     // --- an earlier choice still waiting for its route is answered with where the call is now.
     [self answerPendingChoice];
+    // --- a choice AVAudioSession refuses puts the flag (and with it the mode, the sensor and the
+    // --- override) back, as a refused choice changes nothing.
+    const int previousFlag = _forceSpeakerOn;
     @try {
         if ([audioRoute isEqualToString:@"SPEAKER_PHONE"]) {
             // --- the mode follows the flag (video chat for a video call), then the override.
@@ -549,7 +576,7 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
         }
         AVAudioSessionRouteDescription *route = _audioSession.currentRoute;
         NSArray<AVAudioSessionPortDescription *> *inputs = _audioSession.availableInputs;
-        AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:audioRoute inputs:inputs];
+        AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:audioRoute inputs:inputs route:route uid:nil];
         BOOL available;
         if ([audioRoute isEqualToString:@"EARPIECE"]) {
             // --- iOS has no receiver override: a wired or USB headset keeps the output whatever
@@ -560,7 +587,7 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
             // --- under a forced speaker.
             available = input != nil
                 || [self route:route hasOutputOnAudioRoute:audioRoute]
-                || [self isOutputUnderSpeakerOverride:audioRoute];
+                || [self isOutputUnderSpeakerOverride:audioRoute route:route];
         }
         if (!available) {
             // --- refused before anything changed: the route stays as it was.
@@ -568,21 +595,36 @@ RCT_EXPORT_METHOD(chooseAudioRoute:(NSString *)audioRoute
                    [NSString stringWithFormat:@"chooseAudioRoute(): %@ is not available", audioRoute], nil);
             return;
         }
-        // --- the mode follows the flag. A video call is in video chat mode, which defaults
-        // --- to the speaker: the earpiece needs voice chat mode, or the built-in mic stays
-        // --- paired with the speaker. This also clears a speaker override, which an
-        // --- output-only device needs before it can be the route.
-        [self applyForceSpeaker:[audioRoute isEqualToString:@"EARPIECE"] ? -1 : 0 caller:@"chooseAudioRoute()"];
-        // --- an output-only device (no input) is the route once the override is gone; nil
-        // --- also drops an earlier pin (the built-in mic for the earpiece).
+        // --- the flag sets the mode: a video call is in video chat mode, which defaults to the
+        // --- speaker. It also clears a speaker override, which an output-only device needs
+        // --- before it can be the route. The input: an output-only device (no input) is the
+        // --- route once the override is gone, and nil also drops an earlier pin.
         NSError *error = nil;
-        if (![_audioSession setPreferredInput:input error:&error]) {
+        BOOL pinned;
+        if ([audioRoute isEqualToString:@"EARPIECE"]) {
+            // --- the mode first: in video chat mode the built-in mic stays paired with the
+            // --- speaker, so the earpiece needs voice chat mode before the pin.
+            [self applyForceSpeaker:-1 caller:@"chooseAudioRoute()"];
+            pinned = [_audioSession setPreferredInput:input error:&error];
+        } else {
+            // --- the device first: a mode change then can't take the call off it. The other way
+            // --- round, video chat mode with the earpiece's built-in mic still preferred puts the
+            // --- call on the speaker until the pin moves it.
+            pinned = [_audioSession setPreferredInput:input error:&error];
+            if (pinned) {
+                [self applyForceSpeaker:0 caller:@"chooseAudioRoute()"];
+            }
+        }
+        if (!pinned) {
+            [self applyForceSpeaker:previousFlag caller:@"chooseAudioRoute()"];
             reject(@"E_AUDIO_ROUTE", error.localizedDescription ?: @"chooseAudioRoute() failed", error);
             return;
         }
         _chosenInputRoute = input != nil ? audioRoute : nil;
+        _chosenInputUID = input.UID;
         [self answerChoice:audioRoute resolve:resolve];
     } @catch (NSException *e) {
+        [self applyForceSpeaker:previousFlag caller:@"chooseAudioRoute()"];
         reject(@"E_AUDIO_ROUTE", [NSString stringWithFormat:@"chooseAudioRoute(): %@", e.reason ?: @"exception"], nil);
     }
 }
@@ -1586,11 +1628,16 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
                      callerMemo:NSStringFromSelector(_cmd)];
     [self updateAudioRoute];
     if (_chosenInputRoute != nil) {
-        AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:_chosenInputRoute];
+        // --- the device chosen, by its UID, rather than the first of its route.
+        AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:_chosenInputRoute
+                                                                          inputs:_audioSession.availableInputs
+                                                                           route:nil
+                                                                             uid:_chosenInputUID];
         NSError *error = nil;
         if (input == nil || ![_audioSession setPreferredInput:input error:&error]) {
             NSLog(@"RNInCallManager.mediaServicesWereReset(): %@ can't be chosen again: %@", _chosenInputRoute, error);
             _chosenInputRoute = nil;
+            _chosenInputUID = nil;
         }
     }
     [self sendAudioDeviceChanged];

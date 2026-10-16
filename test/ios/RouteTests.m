@@ -116,7 +116,7 @@ static FakePort *Port(NSString *type, NSString *name)
 @end
 
 static FakePort *gBuiltInMic, *gReceiver, *gSpeaker, *gHeadsetMic, *gHeadphones, *gUSBIn, *gUSBOut, *gUSBMic,
-    *gHFPIn, *gHFPOut, *gCarIn, *gCarOut;
+    *gHFPIn, *gHFPOut, *gCarIn, *gCarOut, *gHDMI;
 static dispatch_queue_t gNotifyQ;
 
 static NSString *reasonName(NSUInteger r)
@@ -147,13 +147,14 @@ static NSString *shortName(NSString *s)
 @property (nonatomic, strong) FakePort *preferredInput;
 @property (nonatomic, strong) FakePort *systemSelected;   // the system route picker's / CallKit's choice
 // the world: what is plugged in or connected
-@property (nonatomic) BOOL wiredMic, wiredNoMic, usb, usbMicOnly, bt, car;
+@property (nonatomic) BOOL wiredMic, wiredNoMic, usb, usbMicOnly, bt, car, hdmi;
 // knobs
 @property (nonatomic) BOOL failPreferredInput;            // setPreferredInput: with a port returns NO
 @property (nonatomic) NSUInteger preferredInputReason;    // the reason posted for a change a preferred input causes
 @property (nonatomic, copy) void (^onDeactivate)(void);   // runs inside setActive:NO (synchronous, AVAudioSession.h)
 @property (nonatomic, strong) FakeRoute *lastRoute;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *pending; // route changes not yet posted
+@property (nonatomic, strong) NSMutableArray<FakeRoute *> *history;    // every route the session went through
 @end
 
 @implementation FakeSession
@@ -163,6 +164,7 @@ static NSString *shortName(NSString *s)
         _category = AVAudioSessionCategorySoloAmbient;
         _mode = AVAudioSessionModeDefault;
         _pending = [NSMutableArray array];
+        _history = [NSMutableArray array];
         _preferredInputReason = AVAudioSessionRouteChangeReasonRouteConfigurationChange;
         _lastRoute = [self computeRoute];
     }
@@ -225,7 +227,7 @@ static NSString *shortName(NSString *s)
         BOOL defaultToSpeaker = (_categoryOptions & AVAudioSessionCategoryOptionDefaultToSpeaker)
             || [_mode isEqualToString:AVAudioSessionModeVideoChat];
         // no receiver override: a wired or USB output keeps the call whatever the input
-        output = wiredOut ? gHeadphones : _usb ? gUSBOut : defaultToSpeaker ? gSpeaker : gReceiver;
+        output = wiredOut ? gHeadphones : _usb ? gUSBOut : _hdmi ? gHDMI : defaultToSpeaker ? gSpeaker : gReceiver;
     }
     r.fakeInputs = @[input];
     r.fakeOutputs = @[output];
@@ -238,6 +240,7 @@ static NSString *shortName(NSString *s)
     if (!force && [now isEqual:_lastRoute]) return;
     FakeRoute *prev = _lastRoute;
     _lastRoute = now;
+    [_history addObject:now];
     [_pending addObject:@{@"reason": @(reason), @"prev": prev}];
     H(@"  (iOS) route change %@: %@ => %@ (queued)", reasonName(reason), prev, now);
 }
@@ -386,6 +389,26 @@ static NSError *FakeError(NSString *what)
         _portOverride = AVAudioSessionPortOverrideNone;
         [self changed:AVAudioSessionRouteChangeReasonCategoryChange force:YES];
     }
+}
+/** mediaserverd restarts: the session is back to its defaults (QA1749), and the app is told. */
+- (void)mediaServicesReset
+{
+    @synchronized (self) {
+        H(@"(world) media services reset: the session is back to SoloAmbient/Default, inactive, no override, no preferred input");
+        _category = AVAudioSessionCategorySoloAmbient;
+        _mode = AVAudioSessionModeDefault;
+        _categoryOptions = 0;
+        _active = NO;
+        _portOverride = AVAudioSessionPortOverrideNone;
+        _preferredInput = nil;
+        _systemSelected = nil;
+        _lastRoute = [self computeRoute];
+        [_pending removeAllObjects];
+    }
+    dispatch_sync(gNotifyQ, ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:AVAudioSessionMediaServicesWereLostNotification object:self];
+        [[NSNotificationCenter defaultCenter] postNotificationName:AVAudioSessionMediaServicesWereResetNotification object:self];
+    });
 }
 - (NSString *)state
 {
@@ -564,12 +587,99 @@ static void s_choices(void)
     CHECK([choose(@"SPEAKER_PHONE") isEqual:@"E_AUDIO_ROUTE_INACTIVE"], @"a choice after stop() is refused");
 }
 
+/** The outputs the session went through since `mark` (an index into its history). */
+static NSArray<NSString *> *outputsSince(NSUInteger mark)
+{
+    @synchronized (gFake) {
+        NSArray *routes = [gFake.history subarrayWithRange:NSMakeRange(mark, gFake.history.count - mark)];
+        return [routes valueForKeyPath:@"fakeOutputs.@unionOfArrays.portName"];
+    }
+}
+static NSUInteger historyMark(void) { @synchronized (gFake) { return gFake.history.count; } }
+
+// A video call on the earpiece (flag -1, the built-in mic pinned) moves to the AirPods without
+// passing through the loudspeaker: the device is pinned before video chat mode (DefaultToSpeaker) is set.
+static void s_video_earpiece_to_bluetooth(void)
+{
+    STEP(@"AirPods connected; start('video'); chooseAudioRoute('EARPIECE')");
+    gFake.bt = YES;
+    start(@"video");
+    choose(@"EARPIECE");
+    CHECK([output() isEqualToString:@"Receiver"] && flag() == -1, @"on the receiver, flag -1 (%@, %d)", output(), flag());
+    STEP(@"chooseAudioRoute('BLUETOOTH')");
+    NSUInteger mark = historyMark();
+    NSDictionary *answer = choose(@"BLUETOOTH");
+    CHECK([answer[@"selectedAudioDevice"] isEqualToString:@"BLUETOOTH"], @"resolves BLUETOOTH (%@)", json(answer));
+    CHECK(![outputsSince(mark) containsObject:@"Speaker"], @"the call never went through the speaker (outputs: %@)", outputsSince(mark));
+    CHECK(flag() == 0, @"flag 0 (%d)", flag());
+}
+
+// AVAudioSession refuses the preferred input: the choice is rejected E_AUDIO_ROUTE and the module's
+// setting is as it was (the flag, the mode, the speaker override).
+static void s_refused_pin_changes_nothing(void)
+{
+    STEP(@"audio call on the forced speaker, AirPods connected; setPreferredInput will fail");
+    gFake.bt = YES;
+    start(@"audio");
+    choose(@"SPEAKER_PHONE");
+    gFake.failPreferredInput = YES;
+    CHECK([choose(@"BLUETOOTH") isEqual:@"E_AUDIO_ROUTE"], @"BLUETOOTH is rejected E_AUDIO_ROUTE");
+    CHECK(flag() == 1 && [output() isEqualToString:@"Speaker"], @"still flag 1 on the speaker (%d, %@)", flag(), output());
+    STEP(@"a video call on its default speaker (flag 0); EARPIECE refused the same way");
+    gFake.failPreferredInput = NO;
+    stop();
+    gFake.bt = NO;
+    start(@"video");
+    gFake.failPreferredInput = YES;
+    CHECK([choose(@"EARPIECE") isEqual:@"E_AUDIO_ROUTE"], @"EARPIECE is rejected E_AUDIO_ROUTE");
+    CHECK(flag() == 0 && [gFake.mode isEqualToString:AVAudioSessionModeVideoChat] && [output() isEqualToString:@"Speaker"],
+          @"still flag 0, video chat mode, on the speaker (%d, %@, %@)", flag(), shortName(gFake.mode), output());
+}
+
+// With flag 1 outliving the speaker (an HDMI output took the call: a device change, so the flag is
+// kept), a refused choice leaves the call where it is instead of putting a speaker override back.
+static void s_refused_choice_keeps_hdmi(void)
+{
+    STEP(@"audio call, speaker forced; an HDMI adapter takes the output");
+    start(@"audio");
+    force(1);
+    [gFake connect:@"hdmi"];
+    deliver();
+    CHECK([output() isEqualToString:@"HDMI"] && flag() == 1, @"on HDMI, flag still 1 (%@, %d)", output(), flag());
+    STEP(@"chooseAudioRoute('WIRED_HEADSET') with no headset");
+    CHECK([choose(@"WIRED_HEADSET") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"refused");
+    CHECK([output() isEqualToString:@"HDMI"], @"the call stays on HDMI (%@)", output());
+}
+
+// Two Bluetooth inputs (a car listed first, the AirPods carrying the call): choosing BLUETOOTH keeps
+// the AirPods, and a media services reset pins the AirPods again, not the first of the route.
+static void s_choice_keeps_the_device(void)
+{
+    STEP(@"the car and the AirPods are connected; the call is on the AirPods");
+    gFake.car = YES;
+    gFake.bt = YES;
+    start(@"audio");
+    CHECK([output() isEqualToString:@"AirPods"], @"on the AirPods (%@)", output());
+    NSDictionary *answer = choose(@"BLUETOOTH");
+    CHECK([output() isEqualToString:@"AirPods"] && [answer[@"selectedAudioDeviceName"] isEqualToString:@"AirPods"],
+          @"BLUETOOTH keeps the AirPods (%@, %@)", output(), json(answer));
+    STEP(@"media services reset");
+    [gFake mediaServicesReset];
+    deliver();
+    CHECK([gFake.preferredInput isEqual:gHFPIn] && [output() isEqualToString:@"AirPods"],
+          @"the AirPods are pinned again (%@, %@)", gFake.preferredInput, output());
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
     @autoreleasepool {
         NSDictionary<NSString *, dispatch_block_t> *scenarios = @{
             @"choices": ^{ s_choices(); },
+            @"choice-keeps-the-device": ^{ s_choice_keeps_the_device(); },
+            @"refused-choice-keeps-hdmi": ^{ s_refused_choice_keeps_hdmi(); },
+            @"refused-pin-changes-nothing": ^{ s_refused_pin_changes_nothing(); },
+            @"video-earpiece-to-bluetooth": ^{ s_video_earpiece_to_bluetooth(); },
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
             @"stale-route-change-after-restart": ^{ s_stale_route_change_after_restart(); },
         };
@@ -596,6 +706,7 @@ int main(int argc, char **argv)
         gHFPOut = Port(AVAudioSessionPortBluetoothHFP, @"AirPods");
         gCarIn = Port(AVAudioSessionPortCarAudio, @"Car");
         gCarOut = Port(AVAudioSessionPortCarAudio, @"Car");
+        gHDMI = Port(AVAudioSessionPortHDMI, @"HDMI");
         gNotifyQ = dispatch_queue_create("tests.notify", DISPATCH_QUEUE_SERIAL);
         gEvents = [NSMutableArray array];
         gFake = [FakeSession new];

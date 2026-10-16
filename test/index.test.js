@@ -215,8 +215,24 @@ function runTypings() {
     assert.doesNotMatch(readme, /never hears anything/);
 }
 
+// chooseAudioRoute's iOS rejection codes: the native method rejects E_AUDIO_ROUTE_INACTIVE outside
+// start()...stop(), E_AUDIO_ROUTE_UNAVAILABLE for a route that isn't there and E_AUDIO_ROUTE when
+// AVAudioSession refuses; the typings and the README name all three.
+function runChooseAudioRouteErrorDocs() {
+    const dts = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const chooseDoc = dts.slice(dts.lastIndexOf('/**', dts.indexOf('chooseAudioRoute(route')), dts.indexOf('chooseAudioRoute(route'));
+    const chooseRow = readme.split('\n').find((line) => line.startsWith('| async chooseAudioRoute('));
+    for (const code of ['E_AUDIO_ROUTE_INACTIVE', 'E_AUDIO_ROUTE_UNAVAILABLE', 'E_AUDIO_ROUTE']) {
+        const word = new RegExp(code + '(?![_A-Z])');
+        assert.match(chooseDoc, word, `index.d.ts chooseAudioRoute names ${code}`);
+        assert.match(chooseRow, word, `README chooseAudioRoute row names ${code}`);
+    }
+}
+
 run();
 runTypings();
+runChooseAudioRouteErrorDocs();
 Promise.all([runAudioRoutes(), runListeners()]).then(() => {
     console.log('index.js wrapper tests passed');
 }, (err) => {
