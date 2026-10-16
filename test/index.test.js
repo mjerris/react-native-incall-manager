@@ -250,9 +250,23 @@ function runChooseAudioRouteErrorDocs() {
     }
 }
 
+// The iOS route rules are scoped to iOS: on Android EARPIECE stays listed with a wired headset,
+// stop() keeps a choice, and setForceSpeakerphoneOn(false) picks the earpiece over a headset.
+function runPlatformScopedDocs() {
+    const dts = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const forceDoc = dts.slice(dts.lastIndexOf('/**', dts.indexOf('setForceSpeakerphoneOn(flag')), dts.indexOf('setForceSpeakerphoneOn(flag'));
+    assert.match(forceDoc, /iOS/, 'index.d.ts setForceSpeakerphoneOn says what false does on iOS');
+    assert.match(forceDoc, /Android/, 'index.d.ts setForceSpeakerphoneOn says what false does on Android');
+    const chooseRow = readme.split('\n').find((line) => line.startsWith('| async chooseAudioRoute('));
+    assert.match(chooseRow, /android: /, 'README chooseAudioRoute row has an android: part');
+    assert.doesNotMatch(chooseRow, /<\/br>[^<]*\. `'EARPIECE'` is not available/, "the EARPIECE rule isn't a general sentence");
+}
+
 run();
 runTypings();
 runChooseAudioRouteErrorDocs();
+runPlatformScopedDocs();
 Promise.all([runAudioRoutes(), runListeners()]).then(() => {
     console.log('index.js wrapper tests passed');
 }, (err) => {

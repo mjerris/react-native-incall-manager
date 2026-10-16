@@ -40,7 +40,12 @@ declare class InCallManager {
 
   setSpeakerphoneOn(enable: boolean): void;
 
-  /** true forces the speaker on, false off, null uses the media type's default. */
+  /**
+   * true forces the speaker on; null uses the media type's default (the speaker for video).
+   * false, on iOS: speaker off (the receiver, or a connected headset or car keeps the call).
+   * false, on Android: the earpiece, also over a connected Bluetooth or wired headset; on a device
+   * without one (no telephony) it changes nothing.
+   */
   setForceSpeakerphoneOn(flag: boolean | null): void;
 
   setMicrophoneMute(enable: boolean): void;
