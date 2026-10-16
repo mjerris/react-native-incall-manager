@@ -677,8 +677,8 @@ static void s_refused_pin_changes_nothing(void)
           @"still flag 0, video chat mode, on the speaker (%d, %@, %@)", flag(), shortName(gFake.mode), output());
 }
 
-// With flag 1 outliving the speaker (an HDMI output took the call: a device change, so the flag is
-// kept), a refused choice leaves the call where it is instead of putting a speaker override back.
+// With an HDMI output carrying the call after a forced speaker, a refused choice leaves the call where
+// it is instead of putting a speaker override back.
 static void s_refused_choice_keeps_hdmi(void)
 {
     STEP(@"audio call, speaker forced; an HDMI adapter takes the output");
@@ -686,9 +686,25 @@ static void s_refused_choice_keeps_hdmi(void)
     force(1);
     [gFake connect:@"hdmi"];
     deliver();
-    CHECK([output() isEqualToString:@"HDMI"] && flag() == 1, @"on HDMI, flag still 1 (%@, %d)", output(), flag());
+    CHECK([output() isEqualToString:@"HDMI"], @"on HDMI (%@)", output());
     STEP(@"chooseAudioRoute('WIRED_HEADSET') with no headset");
     CHECK([choose(@"WIRED_HEADSET") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"refused");
+    CHECK([output() isEqualToString:@"HDMI"], @"the call stays on HDMI (%@)", output());
+}
+
+// A forced speaker, then an output outside the four routes (an HDMI adapter) takes the call: iOS drops
+// the override. The flag must go with it, or the next category change re-applies the speaker over it.
+static void s_hdmi_drops_forced_speaker(void)
+{
+    STEP(@"audio call, speaker forced; an HDMI adapter takes the output");
+    start(@"audio");
+    force(1);
+    [gFake connect:@"hdmi"];
+    deliver();
+    CHECK([output() isEqualToString:@"HDMI"] && flag() == 0, @"on HDMI, the forced speaker dropped (%@, %d)", output(), flag());
+    STEP(@"callkeep or WebRTC sets the category (CategoryChange): the re-apply leaves HDMI alone");
+    [gFake externalCategory:AVAudioSessionCategoryPlayAndRecord options:0x24 mode:AVAudioSessionModeVoiceChat];
+    deliver();
     CHECK([output() isEqualToString:@"HDMI"], @"the call stays on HDMI (%@)", output());
 }
 
@@ -931,6 +947,7 @@ int main(int argc, char **argv)
             @"choices": ^{ s_choices(); },
             @"choice-keeps-the-device": ^{ s_choice_keeps_the_device(); },
             @"refused-choice-keeps-hdmi": ^{ s_refused_choice_keeps_hdmi(); },
+            @"hdmi-drops-forced-speaker": ^{ s_hdmi_drops_forced_speaker(); },
             @"refused-pin-changes-nothing": ^{ s_refused_pin_changes_nothing(); },
             @"video-earpiece-to-bluetooth": ^{ s_video_earpiece_to_bluetooth(); },
             @"earpiece-only-on-iphone": ^{ s_earpiece_only_on_iphone(); },

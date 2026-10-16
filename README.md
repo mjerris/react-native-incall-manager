@@ -299,7 +299,8 @@ category, the call's mode, voice chat for an audio call, and a forced speaker), 
 forced speaker setting (`setForceSpeakerphoneOn` / `chooseAudioRoute`) in step with route
 changes it didn't make, so the re-apply keeps them instead of undoing them: a headset, USB
 headset or car taking the call puts the setting back to the media's default and drops an
-earlier choice's preferred input; the system route picker (`AVRoutePickerView`) or CallKit's
+earlier choice's preferred input, and so does an output outside the four routes (HDMI, line
+out) taking the call from a forced speaker; the system route picker (`AVRoutePickerView`) or CallKit's
 speaker button choosing the speaker, the receiver or a device sets it when iOS reports the change
 with reason `Override`, `Unknown` or `RouteConfigurationChange`. A change reported as
 `CategoryChange` is re-applied over instead (which reason iOS posts for these hasn't been confirmed

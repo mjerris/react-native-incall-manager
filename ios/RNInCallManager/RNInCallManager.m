@@ -521,6 +521,11 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
         // --- device or receiver choice made before doesn't pin the input elsewhere.
         flag = 0;
         [self clearPreferredInputUnlessRoute:output caller:@"followRouteChange()"];
+    } else if (deviceChange && output == nil && flag == 1) {
+        // --- an output outside the four routes (HDMI, line out, a display) took the call from a
+        // --- forced speaker: iOS dropped the override for it. Keeping flag 1 would put the speaker
+        // --- back over it at the next re-apply (a category change, a media services reset).
+        flag = 0;
     } else if (deviceChange) {
         // --- a device left, and iOS chose what follows from the flag (the media's default
         // --- after a device, the receiver after "speaker off"). Nothing to follow.
@@ -545,8 +550,8 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
 /**
  * An output-only device (mic-less headphones, A2DP) has no input to find it by, and only a
  * forced speaker can hide it. Looks under the override, putting it back if the device isn't there.
- * Only while the speaker has the call (`route`): the flag can outlive the override (a device change
- * to HDMI or AirPlay keeps flag 1), and putting the override back then would move the call.
+ * Only while the speaker has the call (`route`): the flag can outlive the override (a forced
+ * speaker set while HDMI or AirPlay had the call), and putting the override back then would move it.
  */
 - (BOOL)isOutputUnderSpeakerOverride:(NSString *)audioRoute route:(AVAudioSessionRouteDescription *)route
 {
