@@ -69,6 +69,9 @@ declare class InCallManager {
   /**
    * A route name; a plain string is accepted too, as before routes were typed. Resolves with an
    * `AudioDeviceStatus` (typed `any`, as in 4.3.0, so existing callers keep compiling).
+   * iOS: resolves once the output is on the chosen route, or after a second with the route iOS
+   * settled on; rejects E_AUDIO_ROUTE_UNAVAILABLE (route unchanged) for a route that isn't
+   * there, EARPIECE included while a wired or USB headset is plugged in.
    */
   chooseAudioRoute(route: AudioRoute | (string & {})): Promise<any>;
 
@@ -78,6 +81,7 @@ declare class InCallManager {
   /**
    * Subscribes to one of this module's events. Use this rather than
    * DeviceEventEmitter: on iOS the native side sends only to a NativeEventEmitter.
+   * On iOS the Android-only events get a subscription that never fires.
    */
   addListener(event: "onAudioDeviceChanged", listener: (status: AudioDeviceStatus) => void): { remove(): void };
   addListener(event: "Proximity", listener: (data: { isNear: boolean }) => void): { remove(): void };
