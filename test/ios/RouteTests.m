@@ -150,6 +150,7 @@ static NSString *shortName(NSString *s)
 // the world: what is plugged in or connected
 @property (nonatomic) BOOL wiredMic, wiredNoMic, usb, usbMicOnly, bt, car, hdmi;
 @property (nonatomic) BOOL noReceiver;                    // an iPad: the built-in output is the speaker
+@property (nonatomic) BOOL handingOver;                   // CallKit moving the session between calls (see callKitHandsOver)
 // knobs
 @property (nonatomic) BOOL failPreferredInput;            // setPreferredInput: with a port returns NO
 @property (nonatomic) NSUInteger preferredInputReason;    // the reason posted for a change a preferred input causes
@@ -204,7 +205,7 @@ static NSString *shortName(NSString *s)
         r.fakeOutputs = @[wiredOut ? gHeadphones : _usb ? gUSBOut : gSpeaker];
         return r;
     }
-    if (_portOverride == AVAudioSessionPortOverrideSpeaker) {
+    if (_portOverride == AVAudioSessionPortOverrideSpeaker || _handingOver) {
         r.fakeInputs = @[gBuiltInMic];
         r.fakeOutputs = @[gSpeaker];
         return r;
@@ -394,6 +395,38 @@ static NSError *FakeError(NSString *what)
         _portOverride = AVAudioSessionPortOverrideNone;
         [self changed:AVAudioSessionRouteChangeReasonCategoryChange force:YES];
     }
+}
+/**
+ * End & Accept, as the device log showed it (iPhone 15 Pro Max, iOS 27.2, test5EndAndAccept-114407):
+ * CallKit deactivates the ended call's session (didDeactivateAudioSession), callkeep's answer for the
+ * accepted call has already set PlayAndRecord with AllowBluetooth|AllowBluetoothA2DP and mode
+ * Default without a CategoryChange reaching the app, and iOS then posts a RouteConfigurationChange
+ * whose route is on the speaker (Receiver -> Speaker, mode Default).
+ */
+- (void)callKitHandsOver
+{
+    @synchronized (self) {
+        H(@"(world) CallKit deactivates the ended call's session; callkeep's answer set PlayAndRecord/Default options=0x24");
+        _active = NO;
+        _category = AVAudioSessionCategoryPlayAndRecord;
+        _categoryOptions = AVAudioSessionCategoryOptionAllowBluetooth | AVAudioSessionCategoryOptionAllowBluetoothA2DP;
+        _mode = AVAudioSessionModeDefault;
+        _portOverride = AVAudioSessionPortOverrideNone;
+        _handingOver = YES;
+        [self changed:AVAudioSessionRouteChangeReasonRouteConfigurationChange force:NO];
+    }
+}
+/** CallKit activates the accepted call's session (didActivateAudioSession): callkeep sets it up again. */
+- (void)callKitActivates
+{
+    @synchronized (self) {
+        H(@"(world) CallKit activates the accepted call's session");
+        _handingOver = NO;
+        _active = YES;
+    }
+    [self externalCategory:AVAudioSessionCategoryPlayAndRecord
+                   options:AVAudioSessionCategoryOptionAllowBluetooth | AVAudioSessionCategoryOptionAllowBluetoothA2DP
+                      mode:AVAudioSessionModeDefault];
 }
 /** mediaserverd restarts: the session is back to its defaults (QA1749), and the app is told. */
 - (void)mediaServicesReset
@@ -938,6 +971,81 @@ static void s_held_call_keeps_its_route(void)
     CHECK(flag() == -1, @"followed after Ended: flag -1 (%d)", flag());
 }
 
+// The system route picker's "iPhone", or CallKit's speaker button turning the speaker off, after a
+// forced speaker: iOS posts the move to the receiver as a CategoryChange with the category, mode and
+// options unchanged (device logs test3Routes-112324 11:23:57, test4bSystemUI-113008 11:30:48). That
+// is a route choice, not a category to re-apply: the flag follows, and the call stays on the receiver.
+static void pickReceiverAfterSpeaker(BOOL appSpeaker, BOOL bluetooth)
+{
+    gFake.bt = bluetooth;
+    STEP(@"start('audio')");
+    start(@"audio");
+    if (appSpeaker) {
+        STEP(@"the app turns the speaker on (chooseAudioRoute('SPEAKER_PHONE'))");
+        choose(@"SPEAKER_PHONE");
+    } else {
+        STEP(@"the system route picker / CallKit's speaker button chooses the speaker (Override)");
+        [gFake systemPick:@"speaker" reason:AVAudioSessionRouteChangeReasonOverride];
+        deliver();
+    }
+    CHECK([output() isEqualToString:@"Speaker"] && flag() == 1, @"on the speaker, flag 1 (%@, %d)", output(), flag());
+    clearEvents();
+    STEP(@"the picker's iPhone / CallKit's speaker off: posted as a CategoryChange, the session's setup unchanged");
+    [gFake systemPick:@"receiver" reason:AVAudioSessionRouteChangeReasonCategoryChange];
+    deliver();
+    STATE(@"after the receiver choice");
+    CHECK([output() isEqualToString:@"Receiver"], @"the call stays on the receiver (%@)", output());
+    CHECK(flag() == -1, @"the flag follows to -1 (%d)", flag());
+    NSDictionary *last = eventsNamed(@"onAudioDeviceChanged").lastObject[@"body"];
+    CHECK([last[@"selectedAudioDevice"] isEqualToString:@"EARPIECE"], @"the last device report is EARPIECE (%@)", json(last));
+    STEP(@"callkeep or WebRTC then really sets the category (CategoryChange): the receiver is kept");
+    [gFake externalCategory:AVAudioSessionCategoryPlayAndRecord options:0x24 mode:AVAudioSessionModeVoiceChat];
+    deliver();
+    CHECK([output() isEqualToString:@"Receiver"], @"still on the receiver (%@)", output());
+}
+static void s_picker_receiver_after_app_speaker(void) { pickReceiverAfterSpeaker(YES, NO); }
+static void s_callkit_speaker_off(void) { pickReceiverAfterSpeaker(NO, NO); }
+static void s_picker_receiver_with_bluetooth(void) { pickReceiverAfterSpeaker(NO, YES); }
+
+// A category another component really changes (callkeep's activation: options and mode) drops the
+// speaker override: the forced speaker is put back.
+static void s_category_change_restores_forced_speaker(void)
+{
+    STEP(@"start('audio'), speaker forced (flag 1)");
+    start(@"audio");
+    force(1);
+    STEP(@"callkeep sets PlayAndRecord options=0x24 mode Default (CategoryChange): the override is dropped");
+    [gFake externalCategory:AVAudioSessionCategoryPlayAndRecord options:0x24 mode:AVAudioSessionModeDefault];
+    deliver();
+    CHECK([output() isEqualToString:@"Speaker"] && flag() == 1, @"the speaker is put back, flag 1 (%@, %d)", output(), flag());
+    CHECK([gFake.mode isEqualToString:AVAudioSessionModeVoiceChat], @"and the call's mode (%@)", shortName(gFake.mode));
+}
+
+// End & Accept: the session the ended call leaves up is handed to the accepted call. While CallKit
+// moves it, iOS reports a route on the speaker (see callKitHandsOver): that's the handover, not a
+// choice, so the accepted call starts where the media's default puts it (the receiver, or a
+// connected headset), not on a forced speaker.
+static void endAndAccept(BOOL bluetooth)
+{
+    gFake.bt = bluetooth;
+    NSString *expected = bluetooth ? @"AirPods" : @"Receiver";
+    STEP(@"call A: start('audio')");
+    start(@"audio");
+    CHECK([output() isEqualToString:expected] && flag() == 0, @"call A on %@, flag 0 (%@, %d)", expected, output(), flag());
+    STEP(@"End & Accept: CallKit hands the session over (RouteConfigurationChange to the speaker, mode Default)");
+    [gFake callKitHandsOver];
+    deliver();
+    STEP(@"CallKit activates call B's session; callkeep sets it up (CategoryChange)");
+    [gFake callKitActivates];
+    deliver();
+    STATE(@"call B");
+    CHECK([output() isEqualToString:expected], @"call B starts on %@ (%@)", expected, output());
+    CHECK(flag() == 0, @"the flag is still the media's default (%d)", flag());
+    CHECK([gFake.mode isEqualToString:AVAudioSessionModeVoiceChat], @"in the call's mode (%@)", shortName(gFake.mode));
+}
+static void s_end_and_accept_on_receiver(void) { endAndAccept(NO); }
+static void s_end_and_accept_on_bluetooth(void) { endAndAccept(YES); }
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
@@ -959,6 +1067,12 @@ int main(int argc, char **argv)
             @"headset-mic-under-earpiece-pin": ^{ s_headset_mic_under_earpiece_pin(); },
             @"usb-microphone": ^{ s_usb_microphone(); },
             @"stale-route-change-after-restart": ^{ s_stale_route_change_after_restart(); },
+            @"picker-receiver-after-app-speaker": ^{ s_picker_receiver_after_app_speaker(); },
+            @"callkit-speaker-off": ^{ s_callkit_speaker_off(); },
+            @"picker-receiver-with-bluetooth": ^{ s_picker_receiver_with_bluetooth(); },
+            @"category-change-restores-forced-speaker": ^{ s_category_change_restores_forced_speaker(); },
+            @"end-and-accept-on-receiver": ^{ s_end_and_accept_on_receiver(); },
+            @"end-and-accept-on-bluetooth": ^{ s_end_and_accept_on_bluetooth(); },
         };
         NSString *scenario = argc > 1 ? @(argv[1]) : @"";
         if ([scenario isEqualToString:@"--list"]) {

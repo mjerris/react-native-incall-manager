@@ -71,6 +71,12 @@
     // --- interruption's end, by a category change (the session being set up again on resume: callkeep
     // --- on CallKit's activation, WebRTC) and by start(). Route queue only.
     BOOL _sessionInterrupted;
+    // --- the session's category, mode and options when this module last handled a route change or
+    // --- applied its route (sessionSetup); nil from start() until then. A route change that finds the
+    // --- session set up differently is someone else setting it up (callkeep, WebRTC, CallKit moving
+    // --- it between calls): its route is re-applied, not followed. One that finds the same setup is a
+    // --- route choice, whatever reason iOS gives it. Route queue only.
+    NSString *_seenSessionSetup;
     int _forceSpeakerOn;
     NSString *_media;
     BOOL _hasListeners;
@@ -476,6 +482,13 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
     }
 }
 
+/** The session's category, mode and options, for _seenSessionSetup. */
+- (NSString *)sessionSetup
+{
+    return [NSString stringWithFormat:@"%@|%@|%lu", _audioSession.category, _audioSession.mode,
+            (unsigned long)_audioSession.categoryOptions];
+}
+
 /**
  * Keeps _forceSpeakerOn, and the preferred input, in step with a route change this module didn't
  * make, so the category-change re-apply in updateAudioRoute keeps what iOS or the user chose
@@ -483,13 +496,17 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
  *
  * - a device arriving or leaving (NewDeviceAvailable, OldDeviceUnavailable): iOS has already
  *   moved the call, dropping a speaker override when a headset or car took it;
- * - an output override, or a reason iOS doesn't name (Override, Unknown, RouteConfigurationChange):
- *   the system route picker or CallKit's speaker button chose the speaker, the receiver or a
- *   device. This module's own overrides and preferred inputs post these too, but they move the
- *   call to where the flag puts it, so the previous route (AVAudioSessionRouteChangePreviousRouteKey)
- *   didn't fit the flag; someone else's move the call away from there.
- * - every other reason leaves the flag alone. A category change is re-applied instead
- *   (updateAudioRoute): sampling the route then would read the override it just dropped.
+ * - an output override, or a reason iOS doesn't name (Override, Unknown, RouteConfigurationChange),
+ *   or a CategoryChange that left the category, mode and options as they were: the system route
+ *   picker or CallKit's speaker button chose the speaker, the receiver or a device (iOS 27 posts the
+ *   picker's "iPhone" and CallKit's speaker off as a CategoryChange). This module's own overrides
+ *   and preferred inputs post these too, but they move the call to where the flag puts it, so the
+ *   previous route (AVAudioSessionRouteChangePreviousRouteKey) didn't fit the flag; someone else's
+ *   move the call away from there.
+ * - every other reason leaves the flag alone. A change that came with the session set up anew
+ *   (handleRouteChange) is re-applied instead (updateAudioRoute) and doesn't reach here: sampling
+ *   the route then would read the override that setup just dropped, or the route CallKit reports
+ *   while it moves the session between calls.
  *
  * Flag values: 1 forces the speaker, -1 is "speaker off" (voice chat mode for a video call),
  * 0 is the media's default (video chat mode, on the speaker, for a video call).
@@ -503,7 +520,8 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
     if (!deviceChange) {
         if (reason != AVAudioSessionRouteChangeReasonOverride
                 && reason != AVAudioSessionRouteChangeReasonUnknown
-                && reason != AVAudioSessionRouteChangeReasonRouteConfigurationChange) {
+                && reason != AVAudioSessionRouteChangeReasonRouteConfigurationChange
+                && reason != AVAudioSessionRouteChangeReasonCategoryChange) {
             return;
         }
         if (previousRoute != nil
@@ -729,6 +747,7 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     _lastAudioDeviceStatus = nil;
     _sessionGeneration += 1;
     _sessionInterrupted = NO;
+    _seenSessionSetup = nil;
     [self startAudioSessionNotification];
     [self audioSessionSetCategory:_incallAudioCategory
                           options:0
@@ -1130,6 +1149,7 @@ RCT_EXPORT_METHOD(getIsWiredHeadsetPluggedIn:(RCTPromiseResolveBlock)resolve
     } else {
         NSLog(@"RNInCallManager.updateAudioRoute(): did NOT overrideOutputAudioPort()");
     }
+    _seenSessionSetup = [self sessionSetup];
     //self.debugAudioSession()
 }
 
@@ -1569,13 +1589,18 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     // --- re-apply and the follow may change it, so the report takes a fresh one after them.
     AVAudioSessionRouteDescription *route = _audioSession.currentRoute;
     NSArray<AVAudioSessionPortDescription *> *inputs = _audioSession.availableInputs;
-    NSLog(@"RNInCallManager.AudioRouteChange.Reason: %@. category=%@ mode=%@ previous output=%@ output=%@",
+    NSString *setup = [self sessionSetup];
+    BOOL setUpAnew = ![setup isEqualToString:_seenSessionSetup];
+    BOOL deviceChange = reason == AVAudioSessionRouteChangeReasonNewDeviceAvailable
+        || reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable;
+    NSLog(@"RNInCallManager.AudioRouteChange.Reason: %@. category=%@ mode=%@ options=%lu%@ previous output=%@ output=%@",
           RNInCallManagerRouteChangeReasonName(reason), _audioSession.category, _audioSession.mode,
+          (unsigned long)_audioSession.categoryOptions, setUpAnew ? @" (set up anew)" : @"",
           previousRoute.outputs.firstObject.portType, route.outputs.firstObject.portType);
     BOOL wiredBefore = _wiredOutputPlugged;
     [self noteWiredOutputInRoute:route inputs:inputs reason:reason previousRoute:previousRoute];
     [self sendWiredHeadsetForRouteChange:reason previousRoute:previousRoute route:route inputs:inputs wiredBefore:wiredBefore];
-    if (reason == AVAudioSessionRouteChangeReasonCategoryChange) {
+    if (reason == AVAudioSessionRouteChangeReasonCategoryChange && setUpAnew) {
         // --- someone else (WebRTC, CallKit) changed the category, which drops the speaker
         // --- override: put the forced route back. On a resume this is the session set up again.
         _sessionInterrupted = NO;
@@ -1583,9 +1608,15 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     } else if (_sessionInterrupted) {
         // --- another call has the audio: its route isn't this call's choice.
         NSLog(@"RNInCallManager.AudioRouteChange: the session is interrupted; not following");
+    } else if (setUpAnew && !deviceChange) {
+        // --- the session was set up again without a CategoryChange of its own (End & Accept:
+        // --- CallKit moving it to the accepted call, after callkeep's answer set mode Default, posts
+        // --- a RouteConfigurationChange to the speaker): that route is the setup's, not a choice.
+        [self updateAudioRoute];
     } else {
         [self followRouteChange:reason previousRoute:previousRoute currentRoute:route];
     }
+    _seenSessionSetup = [self sessionSetup];
     // --- reported after the re-apply, so a category change doesn't report the route it
     // --- momentarily fell back to.
     BOOL choicePending = _pendingChoiceResolve != nil;
