@@ -13,6 +13,8 @@
 #import <React/RCTEventDispatcher.h>
 #import <React/RCTUtils.h>
 
+#import <sys/sysctl.h>
+
 //static BOOL const automatic = YES;
 
 @implementation RNInCallManager
@@ -254,9 +256,45 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
     return [audioRoute isEqualToString:@"WIRED_HEADSET"] || [audioRoute isEqualToString:@"BLUETOOTH"];
 }
 
+/**
+ * Whether a device of hardware model `model` (hw.machine, e.g. "iPhone17,1") has a receiver: an
+ * iPhone does; an iPad, an iPod touch and a Mac don't. Not the user interface idiom, which is the
+ * app's UI style: an iPhone-only app on an iPad, or on a Mac, reports the phone idiom.
+ */
++ (BOOL)modelHasReceiver:(NSString *)model
+{
+    return [model hasPrefix:@"iPhone"];
+}
+
+/** The hardware model: hw.machine, or the simulated device's on the Simulator. */
++ (NSString *)hardwareModel
+{
+    NSString *simulated = [NSProcessInfo processInfo].environment[@"SIMULATOR_MODEL_IDENTIFIER"];
+    if (simulated.length > 0) {
+        return simulated;
+    }
+    size_t size = 0;
+    if (sysctlbyname("hw.machine", NULL, &size, NULL, 0) != 0 || size == 0) {
+        return @"";
+    }
+    NSMutableData *machine = [NSMutableData dataWithLength:size];
+    if (sysctlbyname("hw.machine", machine.mutableBytes, &size, NULL, 0) != 0) {
+        return @"";
+    }
+    return [NSString stringWithUTF8String:machine.bytes] ?: @"";
+}
+
+/** Read once: the hardware doesn't change, and sysctl is safe off the main thread (UIDevice isn't). */
 - (BOOL)hasEarpiece
 {
-    return _currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone;
+    static BOOL hasReceiver;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *model = [RNInCallManager hardwareModel];
+        hasReceiver = [RNInCallManager modelHasReceiver:model];
+        NSLog(@"RNInCallManager: hardware %@, receiver: %@", model, hasReceiver ? @"YES" : @"NO");
+    });
+    return hasReceiver;
 }
 
 /**

@@ -15,6 +15,7 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
 #import "RNInCallManager.h"
@@ -148,6 +149,7 @@ static NSString *shortName(NSString *s)
 @property (nonatomic, strong) FakePort *systemSelected;   // the system route picker's / CallKit's choice
 // the world: what is plugged in or connected
 @property (nonatomic) BOOL wiredMic, wiredNoMic, usb, usbMicOnly, bt, car, hdmi;
+@property (nonatomic) BOOL noReceiver;                    // an iPad: the built-in output is the speaker
 // knobs
 @property (nonatomic) BOOL failPreferredInput;            // setPreferredInput: with a port returns NO
 @property (nonatomic) NSUInteger preferredInputReason;    // the reason posted for a change a preferred input causes
@@ -227,7 +229,7 @@ static NSString *shortName(NSString *s)
         BOOL defaultToSpeaker = (_categoryOptions & AVAudioSessionCategoryOptionDefaultToSpeaker)
             || [_mode isEqualToString:AVAudioSessionModeVideoChat];
         // no receiver override: a wired or USB output keeps the call whatever the input
-        output = wiredOut ? gHeadphones : _usb ? gUSBOut : _hdmi ? gHDMI : defaultToSpeaker ? gSpeaker : gReceiver;
+        output = wiredOut ? gHeadphones : _usb ? gUSBOut : _hdmi ? gHDMI : (defaultToSpeaker || _noReceiver) ? gSpeaker : gReceiver;
     }
     r.fakeInputs = @[input];
     r.fakeOutputs = @[output];
@@ -429,6 +431,10 @@ static FakeSession *gFake;
 - (UIUserInterfaceIdiom)tests_userInterfaceIdiom { return UIUserInterfaceIdiomPhone; }
 - (void)tests_setProximityMonitoringEnabled:(BOOL)e {}
 - (BOOL)tests_proximityState { return NO; }
+@end
+static NSString *gModel = @"iPhone17,1";
+@implementation NSObject (TestsModel)
++ (NSString *)tests_hardwareModel { return gModel; }
 @end
 @implementation UIApplication (Tests)
 + (instancetype)tests_sharedApplication { return nil; }
@@ -741,6 +747,27 @@ static void s_headset_mic_under_earpiece_pin(void)
     CHECK([output() isEqualToString:@"Headphones"], @"on the headset (%@)", output());
 }
 
+// Only an iPhone has a receiver. An iPhone-only app on an iPad (or a Mac) reports the phone idiom
+// (UIDevice.h: the idiom is the UI's style), and offered and accepted an EARPIECE that never lands.
+static void s_earpiece_only_on_iphone(void)
+{
+    BOOL (^hasReceiver)(NSString *) = ^BOOL(NSString *model) {
+        SEL sel = NSSelectorFromString(@"modelHasReceiver:");
+        if (![RNInCallManager respondsToSelector:sel]) return YES;
+        return ((BOOL (*)(id, SEL, NSString *))objc_msgSend)([RNInCallManager class], sel, model);
+    };
+    CHECK(hasReceiver(@"iPhone17,1"), @"an iPhone has a receiver");
+    for (NSString *model in @[@"iPad13,4", @"iPod9,1", @"arm64", @"MacBookPro18,3", @""]) {
+        CHECK(!hasReceiver(model), @"%@ has none", model);
+    }
+    STEP(@"an iPhone-only app on an iPad (phone idiom); start('audio')");
+    gModel = @"iPad13,4";
+    gFake.noReceiver = YES;
+    start(@"audio");
+    CHECK(![availableRoutes() containsObject:@"EARPIECE"], @"EARPIECE isn't listed (%@)", availableRoutes());
+    CHECK([choose(@"EARPIECE") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"EARPIECE is refused");
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
@@ -751,6 +778,7 @@ int main(int argc, char **argv)
             @"refused-choice-keeps-hdmi": ^{ s_refused_choice_keeps_hdmi(); },
             @"refused-pin-changes-nothing": ^{ s_refused_pin_changes_nothing(); },
             @"video-earpiece-to-bluetooth": ^{ s_video_earpiece_to_bluetooth(); },
+            @"earpiece-only-on-iphone": ^{ s_earpiece_only_on_iphone(); },
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
             @"headphones-under-speaker": ^{ s_headphones_under_speaker(); },
             @"headset-mic-under-earpiece-pin": ^{ s_headset_mic_under_earpiece_pin(); },
@@ -788,6 +816,11 @@ int main(int argc, char **argv)
         swizzleClass([AVAudioSession class], @selector(sharedInstance), @selector(tests_sharedInstance));
         swizzleClass([UIApplication class], @selector(sharedApplication), @selector(tests_sharedApplication));
         swizzleInstance([UIDevice class], @selector(userInterfaceIdiom), @selector(tests_userInterfaceIdiom));
+        if ([RNInCallManager respondsToSelector:@selector(hardwareModel)]) {
+            // --- the module reads the hardware model (the Mac's, here): the scenario's device instead
+            Method m = class_getClassMethod([RNInCallManager class], @selector(hardwareModel));
+            method_setImplementation(m, method_getImplementation(class_getClassMethod([NSObject class], @selector(tests_hardwareModel))));
+        }
         swizzleInstance([UIDevice class], @selector(setProximityMonitoringEnabled:), @selector(tests_setProximityMonitoringEnabled:));
         swizzleInstance([UIDevice class], @selector(proximityState), @selector(tests_proximityState));
 
