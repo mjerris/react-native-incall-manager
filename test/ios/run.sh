@@ -7,6 +7,8 @@
 #   bash test/ios/run.sh <scenario>...   some of them (bash test/ios/run.sh --list names them)
 #   INCALL_M=<file.m> bash test/ios/run.sh   test another copy of RNInCallManager.m
 #
+# First checks that the podspec's source_files are the library's own (test/ios/podspec_check.rb).
+#
 # The binary and the logs go to test/ios/build/ (ignored by git).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +17,9 @@ SRC="${INCALL_M:-$ROOT/ios/RNInCallManager/RNInCallManager.m}"
 OUT="$HERE/build"
 BIN="$OUT/route-tests"
 mkdir -p "$OUT/logs"
+
+# the pod compiles only the library's sources, not these tests (RouteTests.m has a main)
+ruby "$HERE/podspec_check.rb"
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 xcrun clang -fobjc-arc -fmodules -target arm64-apple-ios17.0-macabi -isysroot "$SDK" \
