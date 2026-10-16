@@ -302,9 +302,12 @@ headset or car taking the call puts the setting back to the media's default and 
 earlier choice's preferred input, and so does an output outside the four routes (HDMI, line
 out) taking the call from a forced speaker; the system route picker (`AVRoutePickerView`) or CallKit's
 speaker button choosing the speaker, the receiver or a device sets it when iOS reports the change
-with reason `Override`, `Unknown` or `RouteConfigurationChange`. A change reported as
-`CategoryChange` is re-applied over instead (which reason iOS posts for these hasn't been confirmed
-on a device; the `RNInCallManager.AudioRouteChange.Reason` log line shows it). While the call's
+with reason `Override`, `Unknown`, `RouteConfigurationChange` or `CategoryChange`. On iOS 27 the
+picker's "iPhone" and CallKit's speaker-off arrive as a `CategoryChange` that leaves the session's
+category, mode and options as they were, so the module follows it as the user's choice; a change
+that finds the session set up differently (someone else configured it) has the call's route
+re-applied instead. The `RNInCallManager.AudioRouteChange.Reason` log line shows which reason iOS
+posted. While the call's
 session is interrupted (on hold for another call), route changes aren't followed: they are the
 other call's. After a media services reset the module sets up the call's session, chosen device
 and speaker setting again, and restarts a ringback or busy tone that was playing.
