@@ -860,11 +860,35 @@ static void s_media_reset_players(void)
     CHECK(![ivar(@"_audioSessionInitialized") boolValue], @"the call is stopped after the tone");
 }
 
+// The app pinned the built-in mic for its own audio (AirPods connected) before the call: start()
+// clears it so the call isn't held there, and stop() puts it back, as 4.3.0 left it alone.
+static void s_app_preferred_input_restored(void)
+{
+    STEP(@"before the call: the app's PlayAndRecord session prefers the built-in mic; AirPods connected");
+    gFake.bt = YES;
+    [gFake externalCategory:AVAudioSessionCategoryPlayAndRecord options:AVAudioSessionCategoryOptionAllowBluetooth mode:AVAudioSessionModeDefault];
+    gFake.preferredInput = gBuiltInMic;
+    @synchronized (gFake) { [gFake.pending removeAllObjects]; }
+    start(@"audio");
+    CHECK(gFake.preferredInput == nil && [output() isEqualToString:@"AirPods"], @"the call isn't held on the built-in mic (%@, %@)", gFake.preferredInput, output());
+    choose(@"SPEAKER_PHONE");
+    stop();
+    STATE(@"after stop()");
+    CHECK([gFake.preferredInput isEqual:gBuiltInMic], @"the app's preferred input is back (%@)", gFake.preferredInput);
+    STEP(@"a second call, chosen device the AirPods; the app had no preference this time");
+    gFake.preferredInput = nil;
+    start(@"audio");
+    choose(@"BLUETOOTH");
+    stop();
+    CHECK(gFake.preferredInput == nil, @"no preference is left after the call (%@)", gFake.preferredInput);
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
     @autoreleasepool {
         NSDictionary<NSString *, dispatch_block_t> *scenarios = @{
+            @"app-preferred-input-restored": ^{ s_app_preferred_input_restored(); },
             @"choices": ^{ s_choices(); },
             @"choice-keeps-the-device": ^{ s_choice_keeps_the_device(); },
             @"refused-choice-keeps-hdmi": ^{ s_refused_choice_keeps_hdmi(); },

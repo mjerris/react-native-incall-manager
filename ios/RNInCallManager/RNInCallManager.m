@@ -58,6 +58,8 @@
     NSString *_incallAudioCategory;
     NSString *_origAudioCategory;
     NSString *_origAudioMode;
+    // --- the preferred input the app had before start() (its UID), put back by stop().
+    NSString *_origPreferredInputUID;
     BOOL _audioSessionInitialized;
     // --- one per call's session: start() and stop() each move it on. The observers registered
     // --- by start() capture it, so work they queue for an ended session is dropped, even when
@@ -705,6 +707,7 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     }
     NSLog(@"RNInCallManager.start() start InCallManager. media=%@, type=%@, mode=%@", _media, _media, _incallAudioMode);
     [self storeOriginalAudioSetup];
+    _origPreferredInputUID = _audioSession.preferredInput.UID;
     _forceSpeakerOn = 0;
     _lastAudioDeviceStatus = nil;
     _sessionGeneration += 1;
@@ -757,9 +760,11 @@ RCT_EXPORT_METHOD(stop:(NSString *)busytoneUriType)
     } else {
         NSLog(@"RNInCallManager.stop(): stop InCallManager");
         [self answerPendingChoice];
-        // --- the app's own audio after the call shouldn't inherit the call's device choice.
+        // --- the app's own audio after the call shouldn't inherit the call's device choice: the
+        // --- preferred input it had before start() (if any, and still there) is put back.
         [self clearPreferredInput:@"stop()"];
         [self restoreOriginalAudioSetup];
+        [self restoreOriginalPreferredInput];
         [self stopBusytone];
         [self stopProximitySensor];
         [self audioSessionSetActive:NO
@@ -773,6 +778,25 @@ RCT_EXPORT_METHOD(stop:(NSString *)busytoneUriType)
         _sessionGeneration += 1;
         _audioSessionInitialized = NO;
     }
+}
+
+- (void)restoreOriginalPreferredInput
+{
+    NSString *uid = _origPreferredInputUID;
+    _origPreferredInputUID = nil;
+    if (uid == nil) {
+        return;
+    }
+    for (AVAudioSessionPortDescription *input in _audioSession.availableInputs) {
+        if ([input.UID isEqualToString:uid]) {
+            NSError *error = nil;
+            if (![_audioSession setPreferredInput:input error:&error]) {
+                NSLog(@"RNInCallManager.stop(): setPreferredInput(%@) failed: %@", input.portType, error);
+            }
+            return;
+        }
+    }
+    NSLog(@"RNInCallManager.stop(): the preferred input from before start() is gone");
 }
 
 RCT_EXPORT_METHOD(turnScreenOn)
