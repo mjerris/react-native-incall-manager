@@ -71,6 +71,12 @@
     NSString *_chosenInputRoute;
     // --- and the port it pinned (its UID), so the same device is pinned again, not another of the route.
     NSString *_chosenInputUID;
+    // --- whether a wired or USB output is plugged in, as the call's routes last showed it.
+    // --- AVAudioSession lists inputs, not outputs, so mic-less headphones (or a USB headset) under a
+    // --- forced speaker show up nowhere; the routes before the override did show them. Only between
+    // --- start() and stop() (see noteWiredOutputInRoute:).
+    BOOL _wiredOutputPlugged;
+    NSArray<AVAudioSessionPortDescription *> *_lastInputs;
     // --- a choice whose route hasn't shown up in currentRoute yet, answered when it does.
     NSString *_pendingChoiceRoute;
     RCTPromiseResolveBlock _pendingChoiceResolve;
@@ -327,6 +333,10 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
             [available addObject:audioRoute];
         }
     }
+    // --- mic-less headphones (or a USB headset) hidden by a forced speaker: no port shows them.
+    if (_audioSessionInitialized && _wiredOutputPlugged) {
+        [available addObject:@"WIRED_HEADSET"];
+    }
     // --- output-only devices (wired headphones without a mic, A2DP) have no input to list.
     AVAudioSessionPortDescription *output = route.outputs.firstObject;
     NSString *selected = [self audioRouteForOutput:output];
@@ -492,7 +502,12 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
         return NO;
     }
     [self overrideOutputAudioPort:AVAudioSessionPortOverrideNone caller:@"chooseAudioRoute()"];
-    if ([self isCurrentOutputAudioRoute:audioRoute]) {
+    AVAudioSessionRouteDescription *underneath = _audioSession.currentRoute;
+    [self noteWiredOutputInRoute:underneath
+                          inputs:_audioSession.availableInputs
+                          reason:AVAudioSessionRouteChangeReasonUnknown
+                   previousRoute:route];
+    if ([self route:underneath hasOutputOnAudioRoute:audioRoute]) {
         return YES;
     }
     [self overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker caller:@"chooseAudioRoute()"];
@@ -668,6 +683,13 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     // --- puts input choices: a device chosen in an earlier call (the receiver's built-in mic, say)
     // --- must not keep this one off a connected headset or car.
     [self clearPreferredInput:@"start()"];
+    // --- what is plugged in, before a forced speaker can hide it.
+    _wiredOutputPlugged = NO;
+    _lastInputs = nil;
+    [self noteWiredOutputInRoute:_audioSession.currentRoute
+                          inputs:_audioSession.availableInputs
+                          reason:AVAudioSessionRouteChangeReasonUnknown
+                   previousRoute:nil];
 
     if (ringbackUriType.length > 0) {
         NSLog(@"RNInCallManager.start() play ringback first. type=%@", ringbackUriType);
@@ -1126,21 +1148,69 @@ RCT_EXPORT_METHOD(getIsWiredHeadsetPluggedIn:(RCTPromiseResolveBlock)resolve
     return [self isWiredHeadsetPluggedInRoute:_audioSession.currentRoute inputs:_audioSession.availableInputs];
 }
 
-/** A wired headset (headphones, a headset with a mic, or USB audio, as for WIRED_HEADSET) is plugged in. */
+/** Ports of a wired headset's output: headphones (with or without a mic) and USB audio. */
+static NSArray<AVAudioSessionPort> *RNInCallManagerWiredOutputPorts(void)
+{
+    return @[AVAudioSessionPortHeadphones, AVAudioSessionPortUSBAudio];
+}
+
+/**
+ * A wired headset (headphones, a headset with a mic, or a USB-C headset, as for WIRED_HEADSET) is
+ * plugged in: an output that iOS keeps the call on whatever the input, so the earpiece can't be had.
+ * A USB input alone doesn't count: an input-only USB microphone leaves the output where it was.
+ */
 - (BOOL)isWiredHeadsetPluggedInRoute:(AVAudioSessionRouteDescription *)route
                               inputs:(NSArray<AVAudioSessionPortDescription *> *)inputs
 {
-    NSArray<AVAudioSessionPort> *wired = [self portTypesForAudioRoute:@"WIRED_HEADSET"];
-    if ([self route:route hasPortType:wired routeType:@"output"] || [self route:route hasPortType:wired routeType:@"input"]) {
+    if ([self route:route hasPortType:RNInCallManagerWiredOutputPorts() routeType:@"output"]
+            || [self route:route hasPortType:@[AVAudioSessionPortHeadsetMic] routeType:@"input"]) {
         return YES;
     }
     // --- a headset mic can be available without carrying the call (under a forced speaker).
     for (AVAudioSessionPortDescription *input in inputs) {
-        if ([wired containsObject:input.portType]) {
+        if ([input.portType isEqualToString:AVAudioSessionPortHeadsetMic]) {
             return YES;
         }
     }
-    return NO;
+    // --- mic-less headphones (or a USB headset) under a forced speaker: no port shows them, the
+    // --- routes the call went through did.
+    return _audioSessionInitialized && _wiredOutputPlugged;
+}
+
+/**
+ * Keeps _wiredOutputPlugged from one look at the session (`route`, `inputs`), after a route change
+ * with `reason` from `previousRoute`: a wired output in the route is plugged in; the receiver can't
+ * have the call while one is; a device that left (OldDeviceUnavailable) was the wired one if the
+ * previous route had it, or its mic left, or nothing visible left (an output-only device hidden by
+ * the override). Anything else (the speaker, a Bluetooth device) keeps what was known.
+ */
+- (void)noteWiredOutputInRoute:(AVAudioSessionRouteDescription *)route
+                        inputs:(NSArray<AVAudioSessionPortDescription *> *)inputs
+                        reason:(NSUInteger)reason
+                 previousRoute:(AVAudioSessionRouteDescription *)previousRoute
+{
+    NSArray<AVAudioSessionPort> *wiredOutputs = RNInCallManagerWiredOutputPorts();
+    if ([self route:route hasPortType:wiredOutputs routeType:@"output"]) {
+        _wiredOutputPlugged = YES;
+    } else if ([self route:route hasOutputOnAudioRoute:@"EARPIECE"]) {
+        _wiredOutputPlugged = NO;
+    } else if (reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
+        NSSet<NSString *> *present = [NSSet setWithArray:[inputs valueForKey:@"UID"] ?: @[]];
+        BOOL anInputLeft = NO;
+        BOOL aWiredInputLeft = NO;
+        for (AVAudioSessionPortDescription *input in _lastInputs) {
+            if (input.UID != nil && ![present containsObject:input.UID]) {
+                anInputLeft = YES;
+                aWiredInputLeft = aWiredInputLeft || [input.portType isEqualToString:AVAudioSessionPortHeadsetMic]
+                    || [input.portType isEqualToString:AVAudioSessionPortUSBAudio];
+            }
+        }
+        if ([self route:previousRoute hasPortType:wiredOutputs routeType:@"output"] || aWiredInputLeft
+                || (_lastInputs != nil && !anInputLeft)) {
+            _wiredOutputPlugged = NO;
+        }
+    }
+    _lastInputs = inputs;
 }
 
 - (void)audioSessionSetCategory:(NSString *)audioCategory
@@ -1407,7 +1477,9 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     NSLog(@"RNInCallManager.AudioRouteChange.Reason: %@. category=%@ mode=%@ previous output=%@ output=%@",
           RNInCallManagerRouteChangeReasonName(reason), _audioSession.category, _audioSession.mode,
           previousRoute.outputs.firstObject.portType, route.outputs.firstObject.portType);
-    [self sendWiredHeadsetForRouteChange:reason previousRoute:previousRoute route:route inputs:inputs];
+    BOOL wiredBefore = _wiredOutputPlugged;
+    [self noteWiredOutputInRoute:route inputs:inputs reason:reason previousRoute:previousRoute];
+    [self sendWiredHeadsetForRouteChange:reason previousRoute:previousRoute route:route inputs:inputs wiredBefore:wiredBefore];
     if (reason == AVAudioSessionRouteChangeReasonCategoryChange) {
         // --- someone else (WebRTC, CallKit) changed the category, which drops the speaker
         // --- override: put the forced route back.
@@ -1435,6 +1507,7 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
                          previousRoute:(AVAudioSessionRouteDescription *)previousRoute
                                  route:(AVAudioSessionRouteDescription *)route
                                 inputs:(NSArray<AVAudioSessionPortDescription *> *)inputs
+                           wiredBefore:(BOOL)wiredBefore
 {
     NSArray<AVAudioSessionPort> *wired = [self portTypesForAudioRoute:@"WIRED_HEADSET"];
     if (reason == AVAudioSessionRouteChangeReasonNewDeviceAvailable) {
@@ -1447,15 +1520,27 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
         }
         for (AVAudioSessionPortDescription *output in route.outputs) {
             if ([wired containsObject:output.portType]) {
+                // --- the call can keep another input (an earpiece choice's built-in mic) while the
+                // --- headset takes the output: its mic, if it has one, is in availableInputs.
+                AVAudioSessionPortDescription *mic = nil;
+                for (AVAudioSessionPortDescription *input in inputs) {
+                    if ([input.portType isEqualToString:AVAudioSessionPortHeadsetMic]
+                            || [input.portType isEqualToString:AVAudioSessionPortUSBAudio]) {
+                        mic = input;
+                        break;
+                    }
+                }
                 [self sendEventWithName:@"WiredHeadset"
-                                   body:@{@"isPlugged": @YES, @"hasMic": @NO, @"deviceName": output.portType}];
+                                   body:@{@"isPlugged": @YES, @"hasMic": mic != nil ? @YES : @NO,
+                                          @"deviceName": mic.portType ?: output.portType}];
                 return;
             }
         }
     } else if (reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable
             && ![self isWiredHeadsetPluggedInRoute:route inputs:inputs]) {
-        // --- only for a wired headset that left (the previous route had one, when iOS says).
-        BOOL hadWired = previousRoute == nil;
+        // --- only for a wired headset that left: the previous route had one (when iOS says), or
+        // --- one hidden by a forced speaker was known to be plugged in.
+        BOOL hadWired = previousRoute == nil || wiredBefore;
         for (AVAudioSessionPortDescription *port in [previousRoute.inputs arrayByAddingObjectsFromArray:previousRoute.outputs ?: @[]]) {
             hadWired = hadWired || [wired containsObject:port.portType];
         }

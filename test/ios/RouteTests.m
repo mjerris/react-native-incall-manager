@@ -670,6 +670,77 @@ static void s_choice_keeps_the_device(void)
           @"the AirPods are pinned again (%@, %@)", gFake.preferredInput, output());
 }
 
+static BOOL wiredPluggedIn(void)
+{
+    __block BOOL plugged = NO;
+    MQ(^{ [gM getIsWiredHeadsetPluggedIn:^(id r) { plugged = [r boolValue]; } reject:^(NSString *c, NSString *m, NSError *e) {}]; });
+    return plugged;
+}
+
+// Mic-less wired headphones under a forced speaker: no input shows them and the speaker has the
+// output, but they are still plugged in, so EARPIECE isn't listed or accepted and WIRED_HEADSET is;
+// pulling them out is a 'WiredHeadset' isPlugged:false, and EARPIECE is back.
+static void s_headphones_under_speaker(void)
+{
+    STEP(@"start('audio'); mic-less headphones are plugged in (they take the call); then the speaker is forced");
+    start(@"audio");
+    [gFake connect:@"wiredNoMic"];
+    deliver();
+    CHECK([output() isEqualToString:@"Headphones"], @"on the headphones (%@)", output());
+    force(1);
+    CHECK([output() isEqualToString:@"Speaker"], @"on the speaker (%@)", output());
+    NSArray *routes = availableRoutes();
+    CHECK(![routes containsObject:@"EARPIECE"] && [routes containsObject:@"WIRED_HEADSET"], @"WIRED_HEADSET listed, EARPIECE not (%@)", routes);
+    CHECK(wiredPluggedIn(), @"getIsWiredHeadsetPluggedIn() is true");
+    CHECK([choose(@"EARPIECE") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"EARPIECE is refused");
+    CHECK(flag() == 1 && [output() isEqualToString:@"Speaker"], @"and the speaker kept (%d, %@)", flag(), output());
+    NSDictionary *answer = choose(@"WIRED_HEADSET");
+    CHECK([answer[@"selectedAudioDevice"] isEqualToString:@"WIRED_HEADSET"], @"WIRED_HEADSET resolves on the headphones (%@)", json(answer));
+    STEP(@"speaker forced again; the headphones are pulled out (the previous route shows only the speaker)");
+    force(1);
+    clearEvents();
+    [gFake disconnect:@"wiredNoMic"];
+    deliver();
+    NSArray *events = eventsNamed(@"WiredHeadset");
+    CHECK(events.count == 1 && [events.firstObject[@"body"][@"isPlugged"] isEqual:@NO], @"one 'WiredHeadset' isPlugged:false (%@)", json(events));
+    routes = availableRoutes();
+    CHECK([routes containsObject:@"EARPIECE"] && ![routes containsObject:@"WIRED_HEADSET"], @"EARPIECE listed again (%@)", routes);
+    CHECK(!wiredPluggedIn(), @"getIsWiredHeadsetPluggedIn() is false");
+}
+
+// An input-only USB-C microphone leaves the output on the receiver: EARPIECE stays available.
+static void s_usb_microphone(void)
+{
+    STEP(@"start('audio') on the receiver; a USB-C microphone (no output) is plugged in");
+    start(@"audio");
+    force(-1);
+    [gFake connect:@"usbMicOnly"];
+    deliver();
+    CHECK([output() isEqualToString:@"Receiver"], @"the output stays on the receiver (%@)", output());
+    CHECK(!wiredPluggedIn(), @"getIsWiredHeadsetPluggedIn() is false");
+    force(1);
+    CHECK([availableRoutes() containsObject:@"EARPIECE"], @"on the speaker, EARPIECE is listed (%@)", availableRoutes());
+    NSDictionary *answer = choose(@"EARPIECE");
+    CHECK([answer isKindOfClass:[NSDictionary class]] && [answer[@"selectedAudioDevice"] isEqualToString:@"EARPIECE"],
+          @"EARPIECE is accepted and lands (%@)", json(answer));
+}
+
+// EarPods (with a mic) plugged in while an earpiece choice pins the built-in mic: the route is
+// built-in mic -> headphones, but the headset has a mic, and the event says so.
+static void s_headset_mic_under_earpiece_pin(void)
+{
+    STEP(@"start('audio'); chooseAudioRoute('EARPIECE') pins the built-in mic; EarPods are plugged in");
+    start(@"audio");
+    choose(@"EARPIECE");
+    clearEvents();
+    [gFake connect:@"wiredMic"];
+    deliver();
+    NSArray *events = eventsNamed(@"WiredHeadset");
+    CHECK(events.count >= 1 && [events.firstObject[@"body"][@"isPlugged"] isEqual:@YES] && [events.firstObject[@"body"][@"hasMic"] isEqual:@YES],
+          @"'WiredHeadset' isPlugged:true hasMic:true (%@)", json(events));
+    CHECK([output() isEqualToString:@"Headphones"], @"on the headset (%@)", output());
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
@@ -681,6 +752,9 @@ int main(int argc, char **argv)
             @"refused-pin-changes-nothing": ^{ s_refused_pin_changes_nothing(); },
             @"video-earpiece-to-bluetooth": ^{ s_video_earpiece_to_bluetooth(); },
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
+            @"headphones-under-speaker": ^{ s_headphones_under_speaker(); },
+            @"headset-mic-under-earpiece-pin": ^{ s_headset_mic_under_earpiece_pin(); },
+            @"usb-microphone": ^{ s_usb_microphone(); },
             @"stale-route-change-after-restart": ^{ s_stale_route_change_after_restart(); },
         };
         NSString *scenario = argc > 1 ? @(argv[1]) : @"";
