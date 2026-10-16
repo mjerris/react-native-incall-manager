@@ -301,7 +301,8 @@ changes it didn't make, so the re-apply keeps them instead of undoing them: a he
 headset or car taking the call puts the setting back to the media's default and drops an
 earlier choice's preferred input; the system route picker (`AVRoutePickerView`) or CallKit's
 speaker button choosing the speaker, the receiver or a device sets it. After a media services
-reset the module sets up the call's session and chosen device again.
+reset the module sets up the call's session, chosen device and speaker setting again, and restarts
+a ringback or busy tone that was playing.
 
 ## LICENSE:
 

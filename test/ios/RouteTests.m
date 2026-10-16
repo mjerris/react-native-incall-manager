@@ -337,6 +337,9 @@ static NSError *FakeError(NSString *what)
             return NO;
         }
         H(@"AVAS setPreferredInput(%@)", port ?: @"nil");
+        if (port != nil && ![[self computeRoute].fakeInputs containsObject:port]) {
+            _portOverride = AVAudioSessionPortOverrideNone; // it starts a route change, which ends an override
+        }
         _preferredInput = port;
         if (port) _systemSelected = nil;
         [self changed:_preferredInputReason force:NO];
@@ -433,6 +436,37 @@ static FakeSession *gFake;
 - (BOOL)tests_proximityState { return NO; }
 @end
 static NSString *gModel = @"iPhone17,1";
+// the module's bundled tones ("_BUNDLE_"): short silent WAV files next to the test binary
+static NSString *gSoundDir;
+@implementation NSBundle (Tests)
+- (NSURL *)tests_URLForResource:(NSString *)name withExtension:(NSString *)ext
+{
+    if ([name hasPrefix:@"incallmanager_"]) {
+        return [NSURL fileURLWithPath:[gSoundDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"wav"]]];
+    }
+    return [self tests_URLForResource:name withExtension:ext];
+}
+@end
+// players don't make a sound here: play/stop/isPlaying are recorded instead (a real player can't
+// play against the fake session), and a scenario finishes one by calling its delegate.
+static const void *const kPlayingKey = &kPlayingKey;
+@implementation AVAudioPlayer (Tests)
+- (BOOL)tests_play { objc_setAssociatedObject(self, kPlayingKey, @YES, OBJC_ASSOCIATION_RETAIN); return YES; }
+- (void)tests_stop { objc_setAssociatedObject(self, kPlayingKey, @NO, OBJC_ASSOCIATION_RETAIN); }
+- (BOOL)tests_isPlaying { return [objc_getAssociatedObject(self, kPlayingKey) boolValue]; }
+@end
+static void writeSilentWav(NSString *path, double seconds)
+{
+    const uint32_t rate = 8000, frames = (uint32_t)(rate * seconds), dataBytes = frames * 2;
+    NSMutableData *d = [NSMutableData data];
+    void (^u32)(uint32_t) = ^(uint32_t v) { [d appendBytes:&v length:4]; };
+    void (^u16)(uint16_t) = ^(uint16_t v) { [d appendBytes:&v length:2]; };
+    [d appendBytes:"RIFF" length:4]; u32(36 + dataBytes); [d appendBytes:"WAVEfmt " length:8];
+    u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16);
+    [d appendBytes:"data" length:4]; u32(dataBytes);
+    [d increaseLengthBy:dataBytes];
+    [d writeToFile:path atomically:YES];
+}
 @implementation NSObject (TestsModel)
 + (NSString *)tests_hardwareModel { return gModel; }
 @end
@@ -768,6 +802,64 @@ static void s_earpiece_only_on_iphone(void)
     CHECK([choose(@"EARPIECE") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"EARPIECE is refused");
 }
 
+static id ivar(NSString *name)
+{
+    __block id value = nil;
+    MQ(^{ value = [gM valueForKey:name]; });
+    return value;
+}
+
+// AirPods chosen, then the speaker; a media services reset sets the call up again and keeps the
+// speaker on top (the AirPods pin is applied first: its route change would end the override).
+static void s_media_reset_keeps_speaker(void)
+{
+    STEP(@"AirPods connected; start('audio'); chooseAudioRoute('BLUETOOTH'), then ('SPEAKER_PHONE')");
+    gFake.bt = YES;
+    start(@"audio");
+    choose(@"BLUETOOTH");
+    choose(@"SPEAKER_PHONE");
+    CHECK([output() isEqualToString:@"Speaker"] && flag() == 1, @"on the speaker (%@, %d)", output(), flag());
+    STEP(@"media services reset");
+    [gFake mediaServicesReset];
+    deliver();
+    STATE(@"after the reset");
+    CHECK([output() isEqualToString:@"Speaker"] && flag() == 1, @"still on the speaker, flag 1 (%@, %d)", output(), flag());
+    CHECK([gFake.category isEqualToString:AVAudioSessionCategoryPlayAndRecord] && [gFake.mode isEqualToString:AVAudioSessionModeVoiceChat] && gFake.active,
+          @"the call's session is set up again (%@)", [gFake state]);
+    STEP(@"speaker off (null): back to the chosen AirPods");
+    force(0);
+    CHECK([output() isEqualToString:@"AirPods"], @"on the AirPods (%@)", output());
+}
+
+// A reset re-creates the ringback and busy tone players (QA1749): the old ones don't play after it.
+static void s_media_reset_players(void)
+{
+    STEP(@"start('audio') with the bundled ringback");
+    MQ(^{ [gM start:@"audio" auto:YES ringbackUriType:@"_BUNDLE_"]; });
+    deliver();
+    AVAudioPlayer *before = ivar(@"_ringback");
+    CHECK(before != nil && before.isPlaying, @"the ringback plays (%@)", before);
+    [gFake mediaServicesReset];
+    deliver();
+    AVAudioPlayer *after = ivar(@"_ringback");
+    CHECK(after != nil && after != before && after.isPlaying && after.numberOfLoops == -1,
+          @"a new ringback player plays, looping (%@ -> %@)", before, after);
+    CHECK(before.delegate == nil && !before.isPlaying, @"the old one is stopped and detached");
+    STEP(@"stop() with the bundled busy tone; a reset while it plays");
+    MQ(^{ [gM stop:@"_BUNDLE_"]; });
+    deliver();
+    AVAudioPlayer *tone = ivar(@"_busytone");
+    CHECK(tone != nil && tone.isPlaying, @"the busy tone plays (%@)", tone);
+    [gFake mediaServicesReset];
+    deliver();
+    AVAudioPlayer *tone2 = ivar(@"_busytone");
+    CHECK(tone2 != nil && tone2 != tone && tone2.isPlaying && tone.delegate == nil, @"a new busy tone player plays (%@ -> %@)", tone, tone2);
+    STEP(@"the busy tone finishes (its delegate, on the main thread, as AVAudioPlayer does): stop() runs");
+    dispatch_sync(dispatch_get_main_queue(), ^{ [tone2.delegate audioPlayerDidFinishPlaying:tone2 successfully:YES]; });
+    drain();
+    CHECK(![ivar(@"_audioSessionInitialized") boolValue], @"the call is stopped after the tone");
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
@@ -780,6 +872,8 @@ int main(int argc, char **argv)
             @"video-earpiece-to-bluetooth": ^{ s_video_earpiece_to_bluetooth(); },
             @"earpiece-only-on-iphone": ^{ s_earpiece_only_on_iphone(); },
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
+            @"media-reset-keeps-speaker": ^{ s_media_reset_keeps_speaker(); },
+            @"media-reset-players": ^{ s_media_reset_players(); },
             @"headphones-under-speaker": ^{ s_headphones_under_speaker(); },
             @"headset-mic-under-earpiece-pin": ^{ s_headset_mic_under_earpiece_pin(); },
             @"usb-microphone": ^{ s_usb_microphone(); },
@@ -824,6 +918,13 @@ int main(int argc, char **argv)
         swizzleInstance([UIDevice class], @selector(setProximityMonitoringEnabled:), @selector(tests_setProximityMonitoringEnabled:));
         swizzleInstance([UIDevice class], @selector(proximityState), @selector(tests_proximityState));
 
+        gSoundDir = [@(argv[0]) stringByDeletingLastPathComponent];
+        writeSilentWav([gSoundDir stringByAppendingPathComponent:@"incallmanager_ringback.wav"], 0.3);
+        writeSilentWav([gSoundDir stringByAppendingPathComponent:@"incallmanager_busytone.wav"], 0.3);
+        swizzleInstance([NSBundle class], @selector(URLForResource:withExtension:), @selector(tests_URLForResource:withExtension:));
+        swizzleInstance([AVAudioPlayer class], @selector(play), @selector(tests_play));
+        swizzleInstance([AVAudioPlayer class], @selector(stop), @selector(tests_stop));
+        swizzleInstance([AVAudioPlayer class], @selector(isPlaying), @selector(tests_isPlaying));
         H(@"scenario %@", scenario);
         dispatch_async(dispatch_queue_create("tests.js", DISPATCH_QUEUE_SERIAL), ^{
             gM = [[RNInCallManager alloc] init];

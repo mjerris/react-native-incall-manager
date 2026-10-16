@@ -1732,7 +1732,8 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
 
 /**
  * The media server restarted, and the session is back to its defaults (Technical Q&A QA1749):
- * set up the call's category, mode and activation again, then its route and chosen device.
+ * set up the call's category, mode and activation again, then its chosen device and route, and
+ * re-create the ringback and busy tone players, which don't play after a reset.
  */
 - (void)mediaServicesWereReset:(NSUInteger)generation
 {
@@ -1749,21 +1750,67 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     [self audioSessionSetActive:YES
                         options:0
                      callerMemo:NSStringFromSelector(_cmd)];
+    // --- the order of chooseAudioRoute: a device is pinned before the flag is applied (the route
+    // --- change a pin starts ends an output override, so a forced speaker chosen after the device
+    // --- goes on top again, as it was), the earpiece's built-in mic after it (voice chat mode first).
+    BOOL earpiecePin = [_chosenInputRoute isEqualToString:@"EARPIECE"];
+    if (!earpiecePin) {
+        [self pinChosenInputAfterMediaServicesReset];
+    }
     [self updateAudioRoute];
-    if (_chosenInputRoute != nil) {
-        // --- the device chosen, by its UID, rather than the first of its route.
-        AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:_chosenInputRoute
-                                                                          inputs:_audioSession.availableInputs
-                                                                           route:nil
-                                                                             uid:_chosenInputUID];
-        NSError *error = nil;
-        if (input == nil || ![_audioSession setPreferredInput:input error:&error]) {
-            NSLog(@"RNInCallManager.mediaServicesWereReset(): %@ can't be chosen again: %@", _chosenInputRoute, error);
-            _chosenInputRoute = nil;
-            _chosenInputUID = nil;
+    if (earpiecePin) {
+        [self pinChosenInputAfterMediaServicesReset];
+    }
+    _ringback = [self playerAfterMediaServicesReset:_ringback];
+    if (_busytone != nil) {
+        _busytone = [self playerAfterMediaServicesReset:_busytone];
+        if (_busytone == nil) {
+            // --- stop() is waiting for the busy tone to finish, which it now can't.
+            [self stop:@""];
+            return;
         }
     }
     [self sendAudioDeviceChanged];
+}
+
+- (void)pinChosenInputAfterMediaServicesReset
+{
+    if (_chosenInputRoute == nil) {
+        return;
+    }
+    // --- the device chosen, by its UID, rather than the first of its route.
+    AVAudioSessionPortDescription *input = [self preferredInputForAudioRoute:_chosenInputRoute
+                                                                      inputs:_audioSession.availableInputs
+                                                                       route:nil
+                                                                         uid:_chosenInputUID];
+    NSError *error = nil;
+    if (input == nil || ![_audioSession setPreferredInput:input error:&error]) {
+        NSLog(@"RNInCallManager.mediaServicesWereReset(): %@ can't be chosen again: %@", _chosenInputRoute, error);
+        _chosenInputRoute = nil;
+        _chosenInputUID = nil;
+    }
+}
+
+/** A new player for `player`'s sound, playing from the start; nil if there was none or it can't be made. */
+- (AVAudioPlayer *)playerAfterMediaServicesReset:(AVAudioPlayer *)player
+{
+    if (player == nil) {
+        return nil;
+    }
+    // --- the old player must not report a finish (the busy tone's ends the call: stop()).
+    player.delegate = nil;
+    [player stop];
+    NSError *error = nil;
+    AVAudioPlayer *fresh = [[AVAudioPlayer alloc] initWithContentsOfURL:player.url error:&error];
+    if (fresh == nil) {
+        NSLog(@"RNInCallManager.mediaServicesWereReset(): can't play %@ again: %@", player.url.lastPathComponent, error);
+        return nil;
+    }
+    fresh.delegate = self;
+    fresh.numberOfLoops = player.numberOfLoops;
+    [fresh prepareToPlay];
+    [fresh play];
+    return fresh;
 }
 
 - (void)stopAudioSessionMediaServicesWereResetNotification
