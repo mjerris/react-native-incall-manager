@@ -538,11 +538,38 @@ static void s_stale_route_change_after_restart(void)
     CHECK(flag() == 0, @"call B's flag is its own (%d)", flag());
 }
 
+// The basics: choices resolve once the call is on them, the list, and EARPIECE refused (and not
+// listed) while a wired headset is plugged in.
+static void s_choices(void)
+{
+    STEP(@"AirPods connected; start('audio')");
+    gFake.bt = YES;
+    start(@"audio");
+    NSDictionary *answer = choose(@"BLUETOOTH");
+    CHECK([answer[@"selectedAudioDevice"] isEqualToString:@"BLUETOOTH"] && [output() isEqualToString:@"AirPods"],
+          @"BLUETOOTH resolves on the AirPods (%@, %@)", json(answer), output());
+    answer = choose(@"EARPIECE");
+    CHECK([answer[@"selectedAudioDevice"] isEqualToString:@"EARPIECE"] && [output() isEqualToString:@"Receiver"],
+          @"EARPIECE resolves on the receiver (%@)", output());
+    answer = choose(@"SPEAKER_PHONE");
+    CHECK([answer[@"selectedAudioDevice"] isEqualToString:@"SPEAKER_PHONE"] && flag() == 1, @"SPEAKER_PHONE forces the speaker");
+    CHECK([availableRoutes() isEqual:(@[@"EARPIECE", @"SPEAKER_PHONE", @"BLUETOOTH"])], @"the list");
+    STEP(@"a wired headset with a mic is plugged in");
+    [gFake connect:@"wiredMic"];
+    deliver();
+    CHECK(![availableRoutes() containsObject:@"EARPIECE"], @"EARPIECE isn't listed (%@)", availableRoutes());
+    CHECK([choose(@"EARPIECE") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"EARPIECE is refused");
+    CHECK([choose(@"NOT_A_ROUTE") isEqual:@"E_AUDIO_ROUTE_UNAVAILABLE"], @"an unknown route is refused");
+    stop();
+    CHECK([choose(@"SPEAKER_PHONE") isEqual:@"E_AUDIO_ROUTE_INACTIVE"], @"a choice after stop() is refused");
+}
+
 // ---------------------------------------------------------------- main
 int main(int argc, char **argv)
 {
     @autoreleasepool {
         NSDictionary<NSString *, dispatch_block_t> *scenarios = @{
+            @"choices": ^{ s_choices(); },
             @"follows-foreign-override": ^{ s_follows_foreign_override(); },
             @"stale-route-change-after-restart": ^{ s_stale_route_change_after_restart(); },
         };
