@@ -309,7 +309,11 @@ that finds the session set up differently (someone else configured it) has the c
 re-applied instead. The `RNInCallManager.AudioRouteChange.Reason` log line shows which reason iOS
 posted. While the call's
 session is interrupted (on hold for another call), route changes aren't followed: they are the
-other call's. After a media services reset the module sets up the call's session, chosen device
+other call's. While CallKit has the session deactivated between two calls (End & Accept), iOS 27
+reports a route with no input, on the speaker: it belongs to neither call, so it is neither followed
+nor reported (`onAudioDeviceChanged`), and the change that brings an input back has the call's
+route re-applied; an available-inputs change that finds the session set up by someone else is
+reported only after the route change that comes with it. After a media services reset the module sets up the call's session, chosen device
 and speaker setting again, and restarts a ringback or busy tone that was playing.
 
 ## LICENSE:

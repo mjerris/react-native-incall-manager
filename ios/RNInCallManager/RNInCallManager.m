@@ -71,6 +71,9 @@
     // --- interruption's end, by a category change (the session being set up again on resume: callkeep
     // --- on CallKit's activation, WebRTC) and by start(). Route queue only.
     BOOL _sessionInterrupted;
+    // --- a route without input was seen (CallKit deactivated the session between two calls): the
+    // --- next route with one is the session activated again, and is re-applied, not followed.
+    BOOL _sessionDeactivated;
     // --- the session's category, mode and options when this module last handled a route change or
     // --- applied its route (sessionSetup); nil from start() until then. A route change that finds the
     // --- session set up differently is someone else setting it up (callkeep, WebRTC, CallKit moving
@@ -482,6 +485,22 @@ static NSDictionary<NSString *, NSArray<AVAudioSessionPort> *> *RNInCallManagerP
     }
 }
 
+/**
+ * Whether `route` carries no call: the category records, but the route has no input. CallKit
+ * deactivates the session between two calls (End & Accept), and iOS 27 then reports a route with no
+ * input on the speaker: neither call's route, so it is neither followed nor reported.
+ */
+- (BOOL)isDeactivatedRoute:(AVAudioSessionRouteDescription *)route
+{
+    if (route == nil) {
+        return NO;
+    }
+    NSString *category = _audioSession.category;
+    BOOL records = [category isEqualToString:AVAudioSessionCategoryPlayAndRecord]
+        || [category isEqualToString:AVAudioSessionCategoryRecord];
+    return records && route.inputs.count == 0;
+}
+
 /** The session's category, mode and options, for _seenSessionSetup. */
 - (NSString *)sessionSetup
 {
@@ -747,6 +766,7 @@ RCT_EXPORT_METHOD(start:(NSString *)mediaType
     _lastAudioDeviceStatus = nil;
     _sessionGeneration += 1;
     _sessionInterrupted = NO;
+    _sessionDeactivated = NO;
     _seenSessionSetup = nil;
     [self startAudioSessionNotification];
     [self audioSessionSetCategory:_incallAudioCategory
@@ -1575,6 +1595,27 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     }
 }
 
+// --- the available inputs changed: reported, unless the route is no call's. A session someone
+// --- else set up (callkeep's answer: mode Default, on the speaker on iOS 27) is reported after
+// --- the route change that comes with it has put the call's setup back (handleRouteChange).
+- (void)handleAvailableInputsChange
+{
+    AVAudioSessionRouteDescription *route = _audioSession.currentRoute;
+    if ([self isDeactivatedRoute:route]) {
+        _sessionDeactivated = YES;
+        NSLog(@"RNInCallManager.AvailableInputsChange: the route has no input (the session is deactivated); not reporting");
+        return;
+    }
+    if (![[self sessionSetup] isEqualToString:_seenSessionSetup]) {
+        NSLog(@"RNInCallManager.AvailableInputsChange: the session was set up anew (%@); not reporting before its route change", [self sessionSetup]);
+        return;
+    }
+    if (!_hasListeners || !_audioSessionInitialized) {
+        return;
+    }
+    [self sendAudioDeviceStatus:[self audioDeviceStatusForRoute:route inputs:_audioSession.availableInputs]];
+}
+
 - (void)handleRouteChange:(NSUInteger)reason
              previousRoute:(AVAudioSessionRouteDescription *)previousRoute
                 generation:(NSUInteger)generation
@@ -1597,6 +1638,16 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
           RNInCallManagerRouteChangeReasonName(reason), _audioSession.category, _audioSession.mode,
           (unsigned long)_audioSession.categoryOptions, setUpAnew ? @" (set up anew)" : @"",
           previousRoute.outputs.firstObject.portType, route.outputs.firstObject.portType);
+    if ([self isDeactivatedRoute:route]) {
+        // --- CallKit deactivated the session between two calls: the route (on the speaker, iOS
+        // --- 27) is neither call's. Nothing is followed, noted or reported; the change that
+        // --- brings an input back re-applies the call's route.
+        _sessionDeactivated = YES;
+        NSLog(@"RNInCallManager.AudioRouteChange: the route has no input (the session is deactivated); not following or reporting");
+        return;
+    }
+    BOOL reactivated = _sessionDeactivated;
+    _sessionDeactivated = NO;
     BOOL wiredBefore = _wiredOutputPlugged;
     [self noteWiredOutputInRoute:route inputs:inputs reason:reason previousRoute:previousRoute];
     [self sendWiredHeadsetForRouteChange:reason previousRoute:previousRoute route:route inputs:inputs wiredBefore:wiredBefore];
@@ -1608,10 +1659,14 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
     } else if (_sessionInterrupted) {
         // --- another call has the audio: its route isn't this call's choice.
         NSLog(@"RNInCallManager.AudioRouteChange: the session is interrupted; not following");
-    } else if (setUpAnew && !deviceChange) {
+    } else if ((setUpAnew || reactivated) && !deviceChange) {
         // --- the session was set up again without a CategoryChange of its own (End & Accept:
         // --- CallKit moving it to the accepted call, after callkeep's answer set mode Default, posts
-        // --- a RouteConfigurationChange to the speaker): that route is the setup's, not a choice.
+        // --- a RouteConfigurationChange to the speaker), or activated again after a route without
+        // --- input: that route is the setup's, not a choice.
+        if (reactivated) {
+            NSLog(@"RNInCallManager.AudioRouteChange: the session is active again; re-applying the call's route");
+        }
         [self updateAudioRoute];
     } else {
         [self followRouteChange:reason previousRoute:previousRoute currentRoute:route];
@@ -1724,7 +1779,7 @@ static NSString *RNInCallManagerRouteChangeReasonName(NSUInteger reason)
             dispatch_async(strongSelf->_routeQueue, ^{
                 // --- queued by an ended call's observer: that call is over.
                 if (generation == strongSelf->_sessionGeneration) {
-                    [strongSelf sendAudioDeviceChanged];
+                    [strongSelf handleAvailableInputsChange];
                 }
             });
         }];

@@ -151,6 +151,8 @@ static NSString *shortName(NSString *s)
 @property (nonatomic) BOOL wiredMic, wiredNoMic, usb, usbMicOnly, bt, car, hdmi;
 @property (nonatomic) BOOL noReceiver;                    // an iPad: the built-in output is the speaker
 @property (nonatomic) BOOL handingOver;                   // CallKit moving the session between calls (see callKitHandsOver)
+@property (nonatomic) BOOL defaultModeSpeaker;            // PlayAndRecord in mode Default plays on the speaker (see callKeepAnswerSetsDefault)
+@property (nonatomic) BOOL deactivated;                   // CallKit deactivated the session between calls: no input (see callKitDeactivates)
 // knobs
 @property (nonatomic) BOOL failPreferredInput;            // setPreferredInput: with a port returns NO
 @property (nonatomic) NSUInteger preferredInputReason;    // the reason posted for a change a preferred input causes
@@ -205,7 +207,14 @@ static NSString *shortName(NSString *s)
         r.fakeOutputs = @[wiredOut ? gHeadphones : _usb ? gUSBOut : gSpeaker];
         return r;
     }
-    if (_portOverride == AVAudioSessionPortOverrideSpeaker || _handingOver) {
+    if (_deactivated) {
+        // --- the device log: a deactivated PlayAndRecord session's route has no input, on the speaker
+        r.fakeInputs = @[];
+        r.fakeOutputs = @[gSpeaker];
+        return r;
+    }
+    if (_portOverride == AVAudioSessionPortOverrideSpeaker || _handingOver
+            || (_defaultModeSpeaker && [_mode isEqualToString:AVAudioSessionModeDefault])) {
         r.fakeInputs = @[gBuiltInMic];
         r.fakeOutputs = @[gSpeaker];
         return r;
@@ -255,6 +264,15 @@ static NSString *shortName(NSString *s)
         [_pending removeAllObjects];
     }
     for (NSDictionary *n in items) {
+        if (n[@"inputs"] != nil) {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260000
+            if (@available(iOS 26.0, *)) {
+                H(@"  (iOS) posting AVAudioSessionAvailableInputsChangeNotification");
+                [[NSNotificationCenter defaultCenter] postNotificationName:AVAudioSessionAvailableInputsChangeNotification object:self userInfo:nil];
+            }
+#endif
+            continue;
+        }
         H(@"  (iOS) posting AVAudioSessionRouteChangeNotification reason=%@", reasonName([n[@"reason"] unsignedIntegerValue]));
         [[NSNotificationCenter defaultCenter] postNotificationName:AVAudioSessionRouteChangeNotification
                                                             object:self
@@ -415,6 +433,52 @@ static NSError *FakeError(NSString *what)
         _handingOver = YES;
         [self changed:AVAudioSessionRouteChangeReasonRouteConfigurationChange force:NO];
     }
+}
+/**
+ * End & Accept on iOS 27.2 (iPhone 15 Pro Max, CW2 run testCW2EndAccept-fix-001013), step 1: callkeep's
+ * answer for the accepted call set PlayAndRecord, options 0, mode Default without a CategoryChange
+ * reaching the app; when the ended call's WebRTC audio unit stops, iOS posts an available-inputs
+ * change (the microphone's data source) while that setup has the route on the speaker, then a
+ * RouteConfigurationChange Receiver -> Speaker.
+ */
+- (void)callKeepAnswerSetsDefault
+{
+    @synchronized (self) {
+        H(@"(world) callkeep's answer set PlayAndRecord/Default options=0; the ended call's audio unit stops");
+        _category = AVAudioSessionCategoryPlayAndRecord;
+        _categoryOptions = 0;
+        _mode = AVAudioSessionModeDefault;
+        _portOverride = AVAudioSessionPortOverrideNone;
+        _defaultModeSpeaker = YES;
+        [_pending addObject:@{@"inputs": @YES}];
+        H(@"  (iOS) available inputs change (queued)");
+        [self changed:AVAudioSessionRouteChangeReasonRouteConfigurationChange force:NO];
+    }
+}
+/**
+ * Step 2: CallKit deactivates the session between the calls (didDeactivateAudioSession). The device
+ * log's route then has no input and plays on the speaker, posted as a RouteConfigurationChange,
+ * with the call's own mode (VoiceChat) already put back.
+ */
+- (void)callKitDeactivates
+{
+    @synchronized (self) {
+        H(@"(world) CallKit deactivates the session between the calls");
+        _active = NO;
+        _deactivated = YES;
+        [self changed:AVAudioSessionRouteChangeReasonRouteConfigurationChange force:NO];
+    }
+}
+/** Step 3: CallKit activates the accepted call's session; WebRTC sets it up (CategoryChange). */
+- (void)callKitActivatesForWebRTC
+{
+    @synchronized (self) {
+        H(@"(world) CallKit activates the accepted call's session");
+        _deactivated = NO;
+        _defaultModeSpeaker = NO;
+        _active = YES;
+    }
+    [self externalCategory:AVAudioSessionCategoryPlayAndRecord options:0 mode:AVAudioSessionModeVoiceChat];
 }
 /** CallKit activates the accepted call's session (didActivateAudioSession): callkeep sets it up again. */
 - (void)callKitActivates
@@ -1044,6 +1108,55 @@ static void endAndAccept(BOOL bluetooth)
     CHECK([gFake.mode isEqualToString:AVAudioSessionModeVoiceChat], @"in the call's mode (%@)", shortName(gFake.mode));
 }
 static void s_end_and_accept_on_receiver(void) { endAndAccept(NO); }
+
+static NSArray<NSString *> *reportedDevices(void)
+{
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSDictionary *e in eventsNamed(@"onAudioDeviceChanged")) {
+        [out addObject:e[@"body"][@"selectedAudioDevice"] ?: @"?"];
+    }
+    return out;
+}
+
+// End & Accept as iOS 27.2 runs it (see callKeepAnswerSetsDefault, callKitDeactivates): while the
+// session goes from the ended call to the accepted one, iOS puts the route on the speaker twice,
+// first under callkeep's mode Default, then with the session deactivated (no input). Neither is a
+// route of either call: nothing reports SPEAKER_PHONE, the flag isn't moved, and call B starts on
+// the receiver. (On the device the app showed "speaker" for 180 ms and the flag went 0 -> 1.)
+static void endAndAcceptDeactivated(int flagA)
+{
+    STEP(@"call A: start('audio')");
+    start(@"audio");
+    if (flagA != 0) force(flagA);
+    NSString *expected = flagA == 1 ? @"Speaker" : @"Receiver";
+    CHECK([output() isEqualToString:expected] && flag() == flagA, @"call A on %@, flag %d (%@, %d)", expected, flagA, output(), flag());
+    clearEvents();
+    STEP(@"End & Accept: callkeep's answer set mode Default; A's audio unit stops (inputs change, RouteConfigurationChange to the speaker)");
+    [gFake callKeepAnswerSetsDefault];
+    deliver();
+    STATE(@"after the answer's setup");
+    STEP(@"CallKit deactivates the session between the calls (RouteConfigurationChange, no input, the speaker)");
+    [gFake callKitDeactivates];
+    deliver();
+    STATE(@"deactivated");
+    CHECK(flag() == flagA, @"the deactivated session's speaker doesn't move the flag (%d)", flag());
+    STEP(@"CallKit activates call B's session; WebRTC sets it up (CategoryChange)");
+    [gFake callKitActivatesForWebRTC];
+    deliver();
+    STATE(@"call B");
+    NSArray<NSString *> *reported = reportedDevices();
+    H(@"reported during the handover: %@", reported);
+    if (flagA != 1) {
+        CHECK(![reported containsObject:@"SPEAKER_PHONE"], @"no SPEAKER_PHONE reported during the handover (%@)", reported);
+    } else {
+        CHECK(![reported containsObject:@"EARPIECE"], @"no EARPIECE reported during the handover (%@)", reported);
+    }
+    CHECK([output() isEqualToString:expected], @"call B starts on %@ (%@)", expected, output());
+    CHECK(flag() == flagA, @"the flag is call A's (%d)", flag());
+    CHECK([gFake.mode isEqualToString:AVAudioSessionModeVoiceChat], @"in the call's mode (%@)", shortName(gFake.mode));
+}
+static void s_end_and_accept_deactivated_receiver(void) { endAndAcceptDeactivated(0); }
+static void s_end_and_accept_deactivated_speaker(void) { endAndAcceptDeactivated(1); }
 static void s_end_and_accept_on_bluetooth(void) { endAndAccept(YES); }
 
 // ---------------------------------------------------------------- main
@@ -1073,6 +1186,8 @@ int main(int argc, char **argv)
             @"category-change-restores-forced-speaker": ^{ s_category_change_restores_forced_speaker(); },
             @"end-and-accept-on-receiver": ^{ s_end_and_accept_on_receiver(); },
             @"end-and-accept-on-bluetooth": ^{ s_end_and_accept_on_bluetooth(); },
+            @"end-and-accept-deactivated-receiver": ^{ s_end_and_accept_deactivated_receiver(); },
+            @"end-and-accept-deactivated-speaker": ^{ s_end_and_accept_deactivated_speaker(); },
         };
         NSString *scenario = argc > 1 ? @(argv[1]) : @"";
         if ([scenario isEqualToString:@"--list"]) {
